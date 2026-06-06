@@ -59,7 +59,7 @@ class Run:
         body = {
             "events": [
                 {
-                    "id": evt_id,
+                    "external_id": evt_id,
                     "type": type,
                     "ts": _iso(),
                     "data": data or {},

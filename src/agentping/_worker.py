@@ -79,11 +79,22 @@ class Worker:
         self._send(items)
 
     def flush_now(self, deadline_monotonic: float) -> None:
+        first = True
         while time.monotonic() < deadline_monotonic:
+            # Honour backoff between retries (e.g. an event waiting for its
+            # run-start to be persisted) but never let a stale backoff block
+            # the first attempt of an explicit flush.
+            now = time.monotonic()
+            if not first and now < self._backoff_until:
+                wait = min(self._backoff_until, deadline_monotonic) - now
+                if wait > 0:
+                    time.sleep(wait)
+            first = False
+
             items = self._queue.drain(BATCH_SIZE)
             if not items:
                 return
-            self._send(items, override_backoff=True)
+            self._send(items, override_backoff=False)
 
     def _send(self, items: list[dict[str, Any]], override_backoff: bool = False) -> None:
         failed: list[dict[str, Any]] = []
@@ -122,7 +133,19 @@ class Worker:
                     failed.append(item)
                 continue
 
-            if resp.status_code in (400, 401, 403, 404, 409, 422):
+            if resp.status_code == 404:
+                # Run-start is persisted asynchronously, so an event/finish can
+                # arrive before its run row exists. Retry with backoff instead
+                # of dropping; a genuinely missing run drops after MAX_ATTEMPTS.
+                self._last_error = "run_not_ready_404"
+                item["attempts"] = item.get("attempts", 0) + 1
+                if item["attempts"] >= MAX_ATTEMPTS:
+                    dropped += 1
+                else:
+                    failed.append(item)
+                continue
+
+            if resp.status_code in (400, 401, 403, 409, 422):
                 self._last_error = f"client_status_{resp.status_code}"
                 continue
 

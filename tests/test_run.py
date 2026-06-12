@@ -108,3 +108,34 @@ def test_finish_is_idempotent():
     agentping.flush(timeout=2.0)
     finish_calls = [c for c in captured if f"/v1/runs/{r.id}/finish" in c["url"]]
     assert len(finish_calls) == 1
+
+
+def test_run_goal_included_in_run_start():
+    captured: list = []
+    agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test",
+                   transport=_make_capturing_transport(captured))
+
+    r = agentping.run("digest", goal="Send the daily digest to #support")
+    assert r.goal == "Send the daily digest to #support"
+    r.finish(status="success")
+    agentping.flush(timeout=2.0)
+
+    import json as _json
+    start = next(evt for evt in captured if evt["url"].endswith("/v1/runs"))
+    body = _json.loads(start["body"])
+    assert body["goal"] == "Send the daily digest to #support"
+
+
+def test_run_without_goal_omits_the_field():
+    captured: list = []
+    agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test",
+                   transport=_make_capturing_transport(captured))
+
+    r = agentping.run("digest")
+    r.finish(status="success")
+    agentping.flush(timeout=2.0)
+
+    import json as _json
+    start = next(evt for evt in captured if evt["url"].endswith("/v1/runs"))
+    body = _json.loads(start["body"])
+    assert "goal" not in body

@@ -25,6 +25,7 @@ class Run:
         feature: str | None = None,
         metadata: dict[str, Any] | None = None,
         parent_run_id: str | None = None,
+        goal: str | None = None,
     ) -> None:
         s = _state.state()
         region = s.region or "eu"
@@ -33,6 +34,7 @@ class Run:
         self.agent: str = agent
         self.customer_id = customer_id
         self.feature = feature
+        self.goal = goal
         self.metadata = metadata or {}
         self.parent_run_id = parent_run_id or os.environ.get("AGENTPING_PARENT_RUN")
         self.started_at = _iso()
@@ -47,6 +49,8 @@ class Run:
             body["customer_id"] = customer_id
         if feature is not None:
             body["feature"] = feature
+        if goal is not None:
+            body["goal"] = goal
         if metadata:
             body["metadata"] = metadata
         if self.parent_run_id:

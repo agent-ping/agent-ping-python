@@ -69,6 +69,7 @@ def run(
     feature: str | None = None,
     metadata: dict[str, Any] | None = None,
     parent_run_id: str | None = None,
+    goal: str | None = None,
 ) -> Run:
     return Run(
         agent=agent,
@@ -76,6 +77,7 @@ def run(
         feature=feature,
         metadata=metadata,
         parent_run_id=parent_run_id,
+        goal=goal,
     )
 
 

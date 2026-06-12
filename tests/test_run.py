@@ -139,3 +139,14 @@ def test_run_without_goal_omits_the_field():
     start = next(evt for evt in captured if evt["url"].endswith("/v1/runs"))
     body = _json.loads(start["body"])
     assert "goal" not in body
+
+
+def test_active_run_exposed_publicly():
+    captured: list = []
+    agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test",
+                   transport=_make_capturing_transport(captured))
+
+    assert agentping.active_run() is None
+    with agentping.run("triage") as r:
+        assert agentping.active_run() is r
+    assert agentping.active_run() is None

@@ -35,6 +35,7 @@ __version__ = "0.1.0"
 __all__ = [
     "init",
     "run",
+    "active_run",
     "heartbeat",
     "instrument_anthropic",
     "instrument_openai",
@@ -79,6 +80,18 @@ def run(
         parent_run_id=parent_run_id,
         goal=goal,
     )
+
+
+def active_run() -> Run | None:
+    """The run bound to the current context (thread or asyncio task), if any.
+
+    Set by `with agentping.run(...)` / `async with agentping.run(...)`.
+    Integration packages use this to attach events to the caller's run
+    instead of inventing their own.
+    """
+    from .instrumentation._streaming import _active_run
+
+    return _active_run()
 
 
 def heartbeat(

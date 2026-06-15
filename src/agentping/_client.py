@@ -44,6 +44,14 @@ class Client:
         except Exception:
             pass
 
+    def post_raw(self, path: str, body: dict[str, Any]) -> httpx.Response:
+        """POST and return the raw httpx response, letting transport errors
+        propagate and emitting no warnings. The guard gate uses this so it can
+        own its own allow/block/unreachable translation (guard-checks-spec)
+        rather than the telemetry warn-and-retry semantics of post().
+        """
+        return self._http.post(f"{self._base_url}{path}", json=body)
+
     def post(self, path: str, body: dict[str, Any]) -> Response:
         url = f"{self._base_url}{path}"
         try:

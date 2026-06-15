@@ -4,6 +4,7 @@ Public API:
     agentping.init(...)
     agentping.run(...)         -> Run
     agentping.heartbeat(...)
+    agentping.guard.check(...) -> GuardVerdict   # raises Paused on block (hard mode)
     agentping.instrument_anthropic()
     agentping.instrument_openai()
     agentping.instrument_gemini()
@@ -27,8 +28,9 @@ from typing import Any
 
 import httpx
 
-from . import _ids, _state
+from . import _ids, _state, guard
 from ._run import Run, _iso
+from .guard import GuardVerdict, Paused
 
 __version__ = "0.1.0"
 
@@ -36,6 +38,9 @@ __all__ = [
     "init",
     "run",
     "active_run",
+    "guard",
+    "GuardVerdict",
+    "Paused",
     "heartbeat",
     "instrument_anthropic",
     "instrument_openai",
@@ -60,8 +65,15 @@ def init(
     base_url: str | None = None,
     queue_size: int = _state.DEFAULT_QUEUE_SIZE,
     transport: httpx.BaseTransport | None = None,
+    control_url: str | None = None,
 ) -> None:
-    _state.init(api_key=api_key, base_url=base_url, queue_size=queue_size, transport=transport)
+    _state.init(
+        api_key=api_key,
+        base_url=base_url,
+        queue_size=queue_size,
+        transport=transport,
+        control_url=control_url,
+    )
 
 
 def run(

@@ -44,6 +44,45 @@ agentping.heartbeat("daily-summary", status="ok", cost_usd=0.084,
                     duration_ms=12300, metadata={"items": 47})
 ```
 
+## Guard (spend safety net)
+
+Put a guard at the top of a scheduled or autonomous script. It makes one
+synchronous call to AgentPing, which checks your configured rules against your
+real cumulative spend, and refuses to start the run if a rule is tripped (or if
+an operator has paused the agent from the dashboard). Guard is on the Team and
+Business plans.
+
+```python
+from agentping import guard
+
+# Hard mode (default): raises on block, so the script does not run.
+guard.check(customer_ref="acme-corp", agent="nightly-summariser", function="run")
+```
+
+By default a guard fails closed: `mode="hard"` raises `agentping.Paused` on a
+block, and `on_unreachable="block"` means the script does not run unless the
+gate confirms it is safe. That couples your scheduled runs to AgentPing's
+uptime; pass `on_unreachable="allow"` if you would rather run when the gate is
+unreachable.
+
+```python
+try:
+    guard.check(agent="nightly-summariser")
+except agentping.Paused as e:
+    print("blocked by", e.verdict.blocked_by, e.verdict.rules)
+    raise
+
+# Soft mode: branch on the verdict instead of raising.
+v = guard.check(agent="nightly-summariser", mode="soft")
+if v.blocked:
+    sys.exit(0)
+```
+
+A guard at the top of a script protects against the *next invocation* starting,
+not against one run that passes the check and then loops forever. Drop
+`guard.check(...)` at several points (top of a loop, between phases) to turn it
+into a series of gates. Thresholds are set in USD.
+
 ## Auto-instrumentation
 
 One-line patches for each supported provider and framework. Calls made
@@ -125,9 +164,10 @@ agentping.flush(timeout=5.0)
 
 | Var                    | Default                                                                |
 | ---------------------- | ---------------------------------------------------------------------- |
-| `AGENTPING_API_KEY`    | (required)                                                             |
-| `AGENTPING_BASE_URL`   | Derived from the key's region: `https://{region}.ingest.agentping.io`. |
-| `AGENTPING_PARENT_RUN` | Optional. Parent run id for nested agents.                             |
+| `AGENTPING_API_KEY`     | (required)                                                             |
+| `AGENTPING_BASE_URL`    | Derived from the key's region: `https://{region}.ingest.agentping.io`. |
+| `AGENTPING_CONTROL_URL` | Control plane for `guard.check`. Derived from region (EU: `https://agentping.io`). |
+| `AGENTPING_PARENT_RUN`  | Optional. Parent run id for nested agents.                             |
 
 The default base URL is region-aware. `apk_eu_*` keys route to
 `https://eu.ingest.agentping.io`; `apk_us_*` keys route to

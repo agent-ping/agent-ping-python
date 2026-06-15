@@ -32,14 +32,27 @@ def default_base_url_for(region: str) -> str:
     return f"https://{r}.ingest.agentping.io"
 
 
+def default_control_url_for(region: str) -> str:
+    """Control-plane hostname for the SDK to call (guard-checks-spec).
+
+    The guard gate is served by the control plane, not the ingest edge, so
+    it has its own base URL. The EU control plane is served at the apex;
+    other regions are subdomained.
+    """
+    r = region if region in KNOWN_REGIONS else DEFAULT_REGION
+    return "https://agentping.io" if r == "eu" else f"https://{r}.agentping.io"
+
+
 @dataclass
 class State:
     api_key: str = ""
     base_url: str = ""
+    control_url: str = ""
     region: str = DEFAULT_REGION
     queue: BoundedQueue | None = None
     worker: Worker | None = None
     client: Client | None = None
+    control_client: Client | None = None
     initialized: bool = False
     transport: httpx.BaseTransport | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -58,6 +71,7 @@ def init(
     base_url: str | None = None,
     queue_size: int = DEFAULT_QUEUE_SIZE,
     transport: httpx.BaseTransport | None = None,
+    control_url: str | None = None,
 ) -> None:
     global _atexit_registered
 
@@ -68,6 +82,11 @@ def init(
             base_url
             or os.environ.get("AGENTPING_BASE_URL")
             or default_base_url_for(region)
+        )
+        control = (
+            control_url
+            or os.environ.get("AGENTPING_CONTROL_URL")
+            or default_control_url_for(region)
         )
 
         if not key:
@@ -81,10 +100,12 @@ def init(
 
         _state.api_key = key
         _state.base_url = url
+        _state.control_url = control
         _state.region = region
         _state.queue = BoundedQueue(maxsize=queue_size)
         _state.transport = transport
         _state.client = Client(api_key=key, base_url=url, transport=transport)
+        _state.control_client = Client(api_key=key, base_url=control, transport=transport)
         _state.worker = Worker(queue=_state.queue, client=_state.client)
         _state.initialized = True
 
@@ -136,8 +157,11 @@ def _shutdown_locked() -> None:
         _state.worker.stop(timeout=1.0)
     if _state.client is not None:
         _state.client.close()
+    if _state.control_client is not None:
+        _state.control_client.close()
     _state.worker = None
     _state.client = None
+    _state.control_client = None
     _state.queue = None
     _state.initialized = False
 

@@ -6,7 +6,7 @@ Thanks for considering a contribution to the AgentPing Python SDK.
 
 Open a GitHub issue. Useful issues include:
 
-- The version of `agentping-sdk` you're running (`pip show agentping-sdk`).
+- The version of `agentping-io` you're running (`pip show agentping-io`).
 - Your Python version and OS.
 - A minimal reproduction. Snip the surrounding application code; we
   only need the AgentPing calls and the provider client.

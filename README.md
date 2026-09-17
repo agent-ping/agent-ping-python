@@ -1,16 +1,16 @@
-# agentping-sdk
+# agentping-io
 
 Production observability for AI agents. Cost attribution, live
 monitoring, quality scoring. [agentping.io](https://agentping.io) ·
 [docs](https://agentping.io/docs/sdks/python).
 
-The PyPI distribution is `agentping-sdk`. The Python import name is
+The PyPI distribution is `agentping-io`. The Python import name is
 `agentping`.
 
 ## Install
 
 ```bash
-pip install agentping-sdk
+pip install agentping-io
 ```
 
 ## Quickstart
@@ -92,12 +92,12 @@ patches are idempotent.
 **LLM providers** (install the provider's package alongside the matching extra):
 
 ```python
-agentping.instrument_anthropic()   # pip install "agentping-sdk[anthropic]"
-agentping.instrument_openai()      # pip install "agentping-sdk[openai]"
-agentping.instrument_gemini()      # pip install "agentping-sdk[gemini]"
-agentping.instrument_mistral()     # pip install "agentping-sdk[mistral]"
-agentping.instrument_cohere()      # pip install "agentping-sdk[cohere]"
-agentping.instrument_bedrock()     # pip install "agentping-sdk[bedrock]"
+agentping.instrument_anthropic()   # pip install "agentping-io[anthropic]"
+agentping.instrument_openai()      # pip install "agentping-io[openai]"
+agentping.instrument_gemini()      # pip install "agentping-io[gemini]"
+agentping.instrument_mistral()     # pip install "agentping-io[mistral]"
+agentping.instrument_cohere()      # pip install "agentping-io[cohere]"
+agentping.instrument_bedrock()     # pip install "agentping-io[bedrock]"
 ```
 
 Streaming, embeddings, and prompt-cache attribution are captured.

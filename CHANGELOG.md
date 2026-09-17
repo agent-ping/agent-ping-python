@@ -60,6 +60,10 @@ dashboard timeline needs to explain a run, not just price it.
 
 - `AgentPingHooks.on_tool_start` no longer emits; the `tool_call` is
   emitted on `on_tool_end` with the measured latency and result.
+- The PyPI distribution is `agentping-io`. The 0.1.0 notes named it
+  `agentping-sdk`, but that name on PyPI belongs to an unrelated
+  project and 0.1.0 was never uploaded there. Install with
+  `pip install agentping-io`; the import name stays `agentping`.
 
 ### Wire format
 
@@ -103,9 +107,9 @@ Initial public release.
 
 ### Distribution
 
-- Distribution name on PyPI is `agentping-sdk`. The Python import name
-  stays `agentping`. The `agentping` name on PyPI is held by an
-  unrelated project.
+- Distribution name on PyPI was planned as `agentping-sdk` (see 0.2.0:
+  it is `agentping-io`). The Python import name stays `agentping`. The
+  `agentping` name on PyPI is held by an unrelated project.
 
 ## Notes on stability
 

@@ -113,5 +113,6 @@ The 0.x line is pre-1.0. Public API may change before 1.0.0. We do not
 break the wire format between SDK and ingest without a version bump and
 a migration note here.
 
-[Unreleased]: https://github.com/agent-ping/agent-ping-python/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/agent-ping/agent-ping-python/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/agent-ping/agent-ping-python/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/agent-ping/agent-ping-python/releases/tag/v0.1.0

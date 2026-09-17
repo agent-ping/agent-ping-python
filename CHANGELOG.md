@@ -6,6 +6,67 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-17
+
+Timeline depth. Every instrumentation now reports what the run's
+dashboard timeline needs to explain a run, not just price it.
+
+### Fixed
+
+- **`input_tokens` was net of the cached prefix for every provider that
+  reports prompt caching** (Anthropic, OpenAI chat and Responses, Gemini,
+  Bedrock Converse, Pydantic AI, CrewAI, LangChain). Ingest subtracts
+  `cached_input_tokens` itself, so the SDK was double-discounting cache
+  hits and under-reporting cost on cached calls. `input_tokens` is now
+  the gross prompt count on every path; ingest does the split.
+
+### Added
+
+- `llm_call` events carry `finish_reason` and `tool_calls` (the count of
+  tool-use blocks in the response) for every provider that exposes them,
+  plus `reasoning_tokens` when the model reports them (OpenAI, Gemini,
+  LangChain `usage_metadata`).
+- **Errored LLM calls are recorded.** When a patched provider call, a
+  Pydantic AI run or a CrewAI kickoff raises, the SDK emits an
+  `llm_call` with `status: "error"`, `error`, `exception` (the exception
+  class name) and `latency_ms` before re-raising. Timed-out and
+  rate-limited calls now show up on the timeline instead of vanishing.
+- **Tool calls on the timeline.** `AgentPingHooks` (OpenAI Agents) and
+  `AgentPingCallbackHandler` (LangChain) emit `tool_call` events with
+  `tool`, `status`, `tool_invocation_id`, `latency_ms`, and the
+  stringified `input` and `output` (capped at 4000 characters). Pass
+  `capture_tool_payloads=False` to keep arguments and results out of
+  the payload. Tool failures land as `status: "error"` with `error` and
+  `exception`.
+- OpenAI Agents: handoffs are `step` events with
+  `kind: "handoff"`, `from` and `to`; agent start and end are
+  `step` events with `kind: "agent"`, `agent` and `latency_ms`.
+  `on_llm_end` reads `cached_input_tokens` and `reasoning_tokens` from
+  the Responses usage details and infers the provider from
+  `litellm/<provider>/<model>` model names.
+- OpenAI Responses API (`client.responses.create`) is instrumented
+  alongside chat completions, including streaming.
+- Anthropic `client.messages.stream(...)` context manager is
+  instrumented; the `llm_call` is emitted when the stream closes with
+  usage from the final message snapshot.
+- Streamed calls (every provider) emit one `llm_call` when the stream is
+  fully consumed, with `stream: true`.
+- An unhandled exception inside `with agentping.run(...)` now lands as
+  an `error` event (`message`, `exception`) on the timeline before the
+  run finishes `failed`. LlamaIndex `EXCEPTION` callbacks and LangChain
+  `on_chain_error` include the `exception` class name too.
+
+### Changed
+
+- `AgentPingHooks.on_tool_start` no longer emits; the `tool_call` is
+  emitted on `on_tool_end` with the measured latency and result.
+
+### Wire format
+
+Field names match the TypeScript and Laravel SDKs at 0.2.0. Ingest
+accepts events from 0.1.x unchanged, but cost on cached calls is only
+correct from 0.2.0.
+
 ## [0.1.0] - 2026-05-17
 
 Initial public release.

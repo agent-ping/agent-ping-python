@@ -134,7 +134,10 @@ def test_converse_splits_cache_read_into_cached_input_tokens():
         BaseClient._make_api_call = original
 
     data = _collect_llm_events(captured, rid)[0]["data"]
-    assert data["input_tokens"] == 600  # 1000 - 400 cached
+    # Converse reports inputTokens net of the cached prefix (Anthropic
+    # semantics); the cache read is added back so ingest gets the gross
+    # count and subtracts cached_input_tokens itself.
+    assert data["input_tokens"] == 1400
     assert data["cached_input_tokens"] == 400
     assert data["output_tokens"] == 120
 

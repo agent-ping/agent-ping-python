@@ -212,6 +212,7 @@ def test_exception_event_emits_error():
     events = _events_for(captured, rid, "error")
     assert len(events) == 1
     assert "retriever timed out" in events[0]["data"]["message"]
+    assert events[0]["data"]["exception"] == "RuntimeError"
 
 
 def test_handler_resolves_active_run_when_constructed_with_no_arg():

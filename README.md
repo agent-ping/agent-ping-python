@@ -102,7 +102,15 @@ agentping.instrument_bedrock()     # pip install "agentping-sdk[bedrock]"
 
 Streaming, embeddings, and prompt-cache attribution are captured.
 Bedrock covers Converse, ConverseStream, InvokeModel, and
-InvokeModelWithResponseStream across every model family.
+InvokeModelWithResponseStream across every model family. OpenAI covers
+both chat completions and the Responses API.
+
+Each `llm_call` carries the gross `input_tokens`, `output_tokens`,
+`cached_input_tokens`, `cache_creation_input_tokens`, `reasoning_tokens`
+(when the model reports them), `finish_reason`, `tool_calls` (count of
+tool-use blocks) and `latency_ms`. A call that raises is still recorded,
+as an `llm_call` with `status: "error"`, the message and the exception
+class, and the exception is re-raised untouched.
 
 **Agent frameworks:**
 
@@ -126,6 +134,13 @@ agentping.instrument_crewai()
 from agents import Runner
 result = await Runner.run(my_agent, "...", hooks=agentping.AgentPingHooks())
 ```
+
+The LangChain handler and the OpenAI Agents hooks also put tool calls on
+the timeline: one `tool_call` event per tool invocation with the tool
+name, status, latency, and the stringified arguments and result (capped
+at 4000 characters). Pass `capture_tool_payloads=False` to either
+constructor to keep arguments and results out of the payload. OpenAI
+Agents handoffs and agent boundaries arrive as `step` events.
 
 Per-integration docs:
 [Anthropic](https://agentping.io/docs/providers/anthropic) ·

@@ -19,6 +19,7 @@ import time
 from typing import Any
 
 from .. import _warnings
+from ._shared import error_fields
 from ._streaming import _active_run, emit_llm_call
 
 
@@ -141,7 +142,10 @@ def _make_handler_class() -> Any:
                     run.event("retrieve", {"node_count": len(nodes)})
                 elif event_type == CBEventType.EXCEPTION and payload:
                     exc = payload.get("exception")
-                    if exc:
+                    if isinstance(exc, BaseException):
+                        fields = error_fields(exc)
+                        run.event("error", {"message": fields["error"], "exception": fields["exception"]})
+                    elif exc:
                         run.event("error", {"message": str(exc)[:500]})
             except Exception:
                 pass

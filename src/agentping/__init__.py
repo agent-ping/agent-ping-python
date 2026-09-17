@@ -32,7 +32,7 @@ from . import _ids, _state, guard
 from ._run import Run, _iso
 from .guard import GuardVerdict, Paused
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "init",

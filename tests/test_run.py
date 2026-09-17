@@ -83,6 +83,37 @@ def test_context_manager_finishes_failed_on_exception():
     assert json.loads(finish_calls[0]["body"])["status"] == "failed"
 
 
+def test_context_manager_records_error_event_before_finishing_failed():
+    """The exception that ends the block lands on the timeline as an
+    `error` event (message plus exception class) so the dashboard can
+    show why the run failed, not just that it did."""
+    import json
+
+    captured: list = []
+    agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test",
+                   transport=_make_capturing_transport(captured))
+
+    try:
+        with agentping.run("triage") as r:
+            rid = r.id
+            raise ValueError("upstream returned 503")
+    except ValueError:
+        pass
+
+    agentping.flush(timeout=2.0)
+    events = []
+    for c in captured:
+        if f"/v1/runs/{rid}/events" in c["url"]:
+            events.extend(json.loads(c["body"])["events"])
+    errors = [e for e in events if e["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["data"]["message"] == "upstream returned 503"
+    assert errors[0]["data"]["exception"] == "ValueError"
+
+    finish = [c for c in captured if f"/v1/runs/{rid}/finish" in c["url"]]
+    assert json.loads(finish[0]["body"])["status"] == "failed"
+
+
 def test_status_returns_dict():
     agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test",
                    transport=_make_capturing_transport([]))

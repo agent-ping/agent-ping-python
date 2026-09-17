@@ -83,7 +83,7 @@ def test_instrument_crewai_emits_llm_call_from_usage_metrics():
     assert "latency_ms" in data
 
 
-def test_instrument_crewai_splits_cached_prompt_tokens():
+def test_instrument_crewai_reports_gross_prompt_tokens_with_cached_split():
     captured, transport = _capture()
     agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test", transport=transport)
 
@@ -113,9 +113,48 @@ def test_instrument_crewai_splits_cached_prompt_tokens():
         flat.extend(c["body"]["events"])
     llm_events = [e for e in flat if e["type"] == "llm_call"]
     data = llm_events[0]["data"]
-    # 3000 - 1200 = 1800 fresh
-    assert data["input_tokens"] == 1800
+    # prompt_tokens is gross (the cached prefix is part of it); ingest
+    # subtracts cached_input_tokens itself, so nothing is subtracted here.
+    assert data["input_tokens"] == 3000
     assert data["cached_input_tokens"] == 1200
+    assert data["request_count"] == 3
+
+
+def test_instrument_crewai_emits_errored_llm_call_and_reraises():
+    captured, transport = _capture()
+    agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test", transport=transport)
+
+    from crewai import Crew
+    original = Crew.kickoff
+
+    def fake_kickoff(self, *a, **kw):
+        raise RuntimeError("agent loop exhausted")
+
+    Crew.kickoff = fake_kickoff
+
+    try:
+        agentping.instrument_crewai()
+        crew = _make_crew()
+        with agentping.run("market-brief") as r:
+            rid = r.id
+            with pytest.raises(RuntimeError):
+                crew.kickoff()
+        agentping.flush(timeout=2.0)
+    finally:
+        cw_inst.uninstrument()
+        Crew.kickoff = original
+
+    event_calls = [c for c in captured if f"/v1/runs/{rid}/events" in c["url"]]
+    flat = []
+    for c in event_calls:
+        flat.extend(c["body"]["events"])
+    llm_events = [e for e in flat if e["type"] == "llm_call"]
+    assert len(llm_events) == 1
+    data = llm_events[0]["data"]
+    assert data["status"] == "error"
+    assert data["provider"] == "crewai"
+    assert data["error"] == "agent loop exhausted"
+    assert data["exception"] == "RuntimeError"
 
 
 def test_instrument_crewai_is_idempotent():

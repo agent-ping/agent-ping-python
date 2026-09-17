@@ -125,3 +125,24 @@ def test_async_context_manager_supports_aenter_aexit():
     finish_calls = [c for c in captured if c["url"].endswith(f"/v1/runs/{rid}/finish")]
     assert finish_calls, "async __aexit__ did not call finish()"
     assert finish_calls[0]["body"]["status"] == "success"
+
+
+def test_emit_outside_a_run_drops_and_logs_once_at_debug(caplog):
+    """An instrumented call outside `agentping.run(...)` has nowhere to go.
+    The event is dropped, and the drop is logged once per process at debug
+    so it is diagnosable without being noisy."""
+    import logging
+
+    from agentping.instrumentation import _streaming
+
+    agentping.init(api_key="apk_eu_" + "a" * 32, base_url="https://api.test",
+                   transport=httpx.MockTransport(lambda r: httpx.Response(202, json={})))
+    _streaming._reset_warnings_for_tests()
+
+    with caplog.at_level(logging.DEBUG, logger="agentping"):
+        emit_llm_call({"provider": "openai", "model": "gpt-4o-mini", "input_tokens": 1, "output_tokens": 1})
+        emit_llm_call({"provider": "openai", "model": "gpt-4o-mini", "input_tokens": 1, "output_tokens": 1})
+
+    dropped = [r for r in caplog.records if "no run is active" in r.getMessage()]
+    assert len(dropped) == 1
+    assert dropped[0].levelno == logging.DEBUG

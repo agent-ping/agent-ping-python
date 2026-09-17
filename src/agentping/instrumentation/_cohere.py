@@ -1,9 +1,11 @@
 """Cohere V2 SDK instrumentation.
 
-Wraps `cohere.ClientV2.chat` and `cohere.AsyncClientV2.chat`. On a
-successful response, emit an `llm_call` event to the active run.
-Token counts are pulled from `usage.billed_units` (what the user pays
-for) rather than the raw `tokens` block.
+Wraps `cohere.ClientV2.chat`, `chat_stream`, `embed` and the async client.
+Every call emits one `llm_call` to the active run: on success with token
+counts from `usage.billed_units` (what the user pays for) rather than the
+raw `tokens` block, plus `finish_reason` and the number of tool calls; on
+failure with `status: "error"` and the exception class, after which the
+exception is re-raised.
 """
 
 from __future__ import annotations
@@ -12,7 +14,8 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._streaming import emit_llm_call
+from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._streaming import AsyncStreamProxy, StreamProxy, emit_llm_call
 
 _PATCHED = False
 _SUPPORTED_RANGE = ">=5.0.0,<6.0.0"
@@ -26,25 +29,104 @@ def _version_supported(version: str) -> bool:
     return major == 5
 
 
-def _build_payload(response: Any, model: str | None, latency_ms: int) -> dict[str, Any]:
+def _billed_fields(billed: Any) -> dict[str, Any]:
+    if billed is None:
+        return {}
+    fields: dict[str, Any] = {}
+    input_tokens = getattr(billed, "input_tokens", None)
+    output_tokens = getattr(billed, "output_tokens", None)
+    if input_tokens is not None:
+        fields["input_tokens"] = int(input_tokens)
+    if output_tokens is not None:
+        fields["output_tokens"] = int(output_tokens)
+    return fields
+
+
+def _build_payload(response: Any, model: str | None, latency: int, stream: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "cohere",
-        "latency_ms": latency_ms,
+        "latency_ms": latency,
+    }
+    if model:
+        payload["model"] = model
+    usage = getattr(response, "usage", None)
+    payload.update(_billed_fields(getattr(usage, "billed_units", None) if usage is not None else None))
+    put_if_str(payload, "finish_reason", getattr(response, "finish_reason", None))
+    message = getattr(response, "message", None)
+    put_if_positive(payload, "tool_calls", len(getattr(message, "tool_calls", None) or []))
+    if stream:
+        payload["stream"] = True
+    return payload
+
+
+def _build_embed_payload(response: Any, model: str | None, latency: int) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "provider": "cohere",
+        "latency_ms": latency,
+        "kind": "embedding",
     }
     if model:
         payload["model"] = model
 
-    usage = getattr(response, "usage", None)
-    billed = getattr(usage, "billed_units", None) if usage is not None else None
+    # Cohere v5 embed responses carry meta.billed_units.input_tokens.
+    meta = getattr(response, "meta", None)
+    billed = getattr(meta, "billed_units", None) if meta is not None else None
     if billed is not None:
         input_tokens = getattr(billed, "input_tokens", None)
-        output_tokens = getattr(billed, "output_tokens", None)
         if input_tokens is not None:
             payload["input_tokens"] = int(input_tokens)
-        if output_tokens is not None:
-            payload["output_tokens"] = int(output_tokens)
-
+            payload["output_tokens"] = 0
     return payload
+
+
+class _EventAccumulator:
+    """The terminal `message-end` event carries delta.usage.billed_units and
+    delta.finish_reason; each `tool-call-start` is one tool call."""
+
+    def __init__(self, model: str | None) -> None:
+        self.model = model
+        self.billed: Any = None
+        self.finish_reason: str | None = None
+        self.tool_calls = 0
+
+    def observe(self, event: Any) -> None:
+        event_type = getattr(event, "type", None)
+        if event_type == "message-end":
+            delta = getattr(event, "delta", None)
+            usage = getattr(delta, "usage", None) if delta is not None else None
+            billed = getattr(usage, "billed_units", None) if usage is not None else None
+            if billed is not None:
+                self.billed = billed
+            finish = getattr(delta, "finish_reason", None) if delta is not None else None
+            if finish:
+                self.finish_reason = finish
+        elif event_type == "tool-call-start":
+            self.tool_calls += 1
+
+    def payload(self, start: float) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "provider": "cohere",
+            "model": self.model or "unknown",
+            "latency_ms": latency_ms(start),
+            "stream": True,
+        }
+        payload.update(_billed_fields(self.billed))
+        put_if_str(payload, "finish_reason", self.finish_reason)
+        put_if_positive(payload, "tool_calls", self.tool_calls)
+        return payload
+
+
+def _wrap_stream(iterator: Any, model: str | None, start: float, is_async: bool) -> Any:
+    acc = _EventAccumulator(model)
+
+    def on_complete() -> None:
+        emit_llm_call(acc.payload(start))
+
+    def on_error(exc: BaseException) -> None:
+        emit_errored_llm_call("cohere", acc.model, start, exc, {"stream": True})
+
+    proxy = AsyncStreamProxy if is_async else StreamProxy
+    return proxy(iterator, acc.observe, on_complete, on_error)
 
 
 def instrument() -> None:
@@ -84,11 +166,13 @@ def instrument() -> None:
     def patched_chat(self: Any, *args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model")
         start = time.monotonic()
-        result = original_chat(self, *args, **kwargs)
-        latency_ms = int((time.monotonic() - start) * 1000)
         try:
-            payload = _build_payload(result, model, latency_ms)
-            emit_llm_call(payload)
+            result = original_chat(self, *args, **kwargs)
+        except BaseException as exc:
+            emit_errored_llm_call("cohere", model, start, exc)
+            raise
+        try:
+            emit_llm_call(_build_payload(result, model, latency_ms(start)))
         except Exception:
             pass
         return result
@@ -96,31 +180,35 @@ def instrument() -> None:
     ClientV2.chat = patched_chat
     ClientV2._agentping_original_chat = original_chat
 
-    # chat_stream (sync)
     if hasattr(ClientV2, "chat_stream"):
         stream_original = ClientV2.chat_stream
 
         def patched_chat_stream(self: Any, *args: Any, **kwargs: Any) -> Any:
             model = kwargs.get("model")
             start = time.monotonic()
-            iterator = stream_original(self, *args, **kwargs)
-            return _wrap_stream_iterator(iterator, model, start)
+            try:
+                iterator = stream_original(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("cohere", model, start, exc, {"stream": True})
+                raise
+            return _wrap_stream(iterator, model, start, is_async=False)
 
         ClientV2.chat_stream = patched_chat_stream
         ClientV2._agentping_original_chat_stream = stream_original
 
-    # embed (sync)
     if hasattr(ClientV2, "embed"):
         embed_original = ClientV2.embed
 
         def patched_embed(self: Any, *args: Any, **kwargs: Any) -> Any:
             model = kwargs.get("model")
             start = time.monotonic()
-            result = embed_original(self, *args, **kwargs)
-            latency_ms = int((time.monotonic() - start) * 1000)
             try:
-                payload = _build_embed_payload(result, model, latency_ms)
-                emit_llm_call(payload)
+                result = embed_original(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("cohere", model, start, exc, {"kind": "embedding"})
+                raise
+            try:
+                emit_llm_call(_build_embed_payload(result, model, latency_ms(start)))
             except Exception:
                 pass
             return result
@@ -134,11 +222,13 @@ def instrument() -> None:
         async def patched_async_chat(self: Any, *args: Any, **kwargs: Any) -> Any:
             model = kwargs.get("model")
             start = time.monotonic()
-            result = await async_original(self, *args, **kwargs)
-            latency_ms = int((time.monotonic() - start) * 1000)
             try:
-                payload = _build_payload(result, model, latency_ms)
-                emit_llm_call(payload)
+                result = await async_original(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("cohere", model, start, exc)
+                raise
+            try:
+                emit_llm_call(_build_payload(result, model, latency_ms(start)))
             except Exception:
                 pass
             return result
@@ -146,18 +236,35 @@ def instrument() -> None:
         AsyncClientV2.chat = patched_async_chat
         AsyncClientV2._agentping_original_chat = async_original
 
-        # async embed
+        if hasattr(AsyncClientV2, "chat_stream"):
+            async_stream_original = AsyncClientV2.chat_stream
+
+            def patched_async_chat_stream(self: Any, *args: Any, **kwargs: Any) -> Any:
+                model = kwargs.get("model")
+                start = time.monotonic()
+                try:
+                    iterator = async_stream_original(self, *args, **kwargs)
+                except BaseException as exc:
+                    emit_errored_llm_call("cohere", model, start, exc, {"stream": True})
+                    raise
+                return _wrap_stream(iterator, model, start, is_async=True)
+
+            AsyncClientV2.chat_stream = patched_async_chat_stream
+            AsyncClientV2._agentping_original_chat_stream = async_stream_original
+
         if hasattr(AsyncClientV2, "embed"):
             async_embed_original = AsyncClientV2.embed
 
             async def patched_async_embed(self: Any, *args: Any, **kwargs: Any) -> Any:
                 model = kwargs.get("model")
                 start = time.monotonic()
-                result = await async_embed_original(self, *args, **kwargs)
-                latency_ms = int((time.monotonic() - start) * 1000)
                 try:
-                    payload = _build_embed_payload(result, model, latency_ms)
-                    emit_llm_call(payload)
+                    result = await async_embed_original(self, *args, **kwargs)
+                except BaseException as exc:
+                    emit_errored_llm_call("cohere", model, start, exc, {"kind": "embedding"})
+                    raise
+                try:
+                    emit_llm_call(_build_embed_payload(result, model, latency_ms(start)))
                 except Exception:
                     pass
                 return result
@@ -170,70 +277,11 @@ def instrument() -> None:
     _PATCHED = True
 
 
-def _build_embed_payload(response: Any, model: str | None, latency_ms: int) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "provider": "cohere",
-        "latency_ms": latency_ms,
-        "kind": "embedding",
-    }
-    if model:
-        payload["model"] = model
-
-    # Cohere v5 embed responses carry meta.billed_units.input_tokens.
-    meta = getattr(response, "meta", None)
-    billed = getattr(meta, "billed_units", None) if meta is not None else None
-    if billed is not None:
-        input_tokens = getattr(billed, "input_tokens", None)
-        if input_tokens is not None:
-            payload["input_tokens"] = int(input_tokens)
-            payload["output_tokens"] = 0
-    return payload
-
-
-def _wrap_stream_iterator(iterator: Any, model: str | None, start: float) -> Any:
-    """Wrap a Cohere chat_stream iterator. The terminal 'message-end' event
-    carries usage.billed_units; we capture it and emit a single llm_call
-    when the stream closes."""
-
-    def gen():
-        last_billed = None
-        try:
-            for event in iterator:
-                # message-end event carries delta.usage.billed_units
-                event_type = getattr(event, "type", None)
-                if event_type == "message-end":
-                    delta = getattr(event, "delta", None)
-                    usage = getattr(delta, "usage", None) if delta is not None else None
-                    billed = getattr(usage, "billed_units", None) if usage is not None else None
-                    if billed is not None:
-                        last_billed = billed
-                yield event
-        finally:
-            latency_ms = int((time.monotonic() - start) * 1000)
-            try:
-                payload: dict[str, Any] = {
-                    "provider": "cohere",
-                    "model": model or "unknown",
-                    "latency_ms": latency_ms,
-                }
-                if last_billed is not None:
-                    input_tokens = getattr(last_billed, "input_tokens", None)
-                    output_tokens = getattr(last_billed, "output_tokens", None)
-                    if input_tokens is not None:
-                        payload["input_tokens"] = int(input_tokens)
-                    if output_tokens is not None:
-                        payload["output_tokens"] = int(output_tokens)
-                emit_llm_call(payload)
-            except Exception:
-                pass
-
-    return gen()
-
-
 def uninstrument() -> None:
     global _PATCHED
     try:
         import cohere
+
         for cls_attr in ("ClientV2", "AsyncClientV2"):
             cls = getattr(cohere, cls_attr, None)
             if cls is None:

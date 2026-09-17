@@ -67,7 +67,9 @@ def test_instrument_gemini_emits_llm_call():
     data = llm_events[0]["data"]
     assert data["provider"] == "gemini"
     assert data["model"] == "gemini-2.0-flash"
-    assert data["input_tokens"] == 160
+    # prompt_token_count already includes the cached content; ingest
+    # subtracts cached_input_tokens itself, so the gross count is sent.
+    assert data["input_tokens"] == 200
     assert data["cached_input_tokens"] == 40
     assert data["output_tokens"] == 60
     assert "latency_ms" in data

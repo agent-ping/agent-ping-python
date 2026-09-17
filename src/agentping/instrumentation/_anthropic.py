@@ -1,16 +1,25 @@
 """Anthropic SDK instrumentation.
 
-Wraps `anthropic.Anthropic().messages.create` and the async variant.
-On a successful response, emit an `llm_call` event to the active run.
+Wraps `anthropic.Anthropic().messages.create` (plain and `stream=True`),
+`messages.stream(...)` and the async variants. Every call emits one
+`llm_call` to the active run: on success with token usage, `finish_reason`
+and the number of tool calls; on failure with `status: "error"` and the
+exception class, after which the exception is re-raised.
+
+Anthropic reports `input_tokens` net of the cached prefix. Ingest wants the
+gross count (it subtracts `cached_input_tokens` itself), so the cache read
+and creation counts are added back.
 """
 
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from .. import _warnings
-from ._streaming import emit_llm_call
+from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._streaming import AsyncStreamProxy, StreamProxy, emit_llm_call
 
 _PATCHED = False
 _SUPPORTED_RANGE = ">=0.30.0,<2.0.0"
@@ -30,31 +39,175 @@ def _version_supported(version: str) -> bool:
     return major < 2
 
 
-def _build_payload(response: Any, latency_ms: int) -> dict[str, Any]:
+def _usage_fields(usage: Any) -> dict[str, Any]:
+    if usage is None:
+        return {}
+    fields: dict[str, Any] = {}
+    input_tokens = getattr(usage, "input_tokens", None)
+    output_tokens = getattr(usage, "output_tokens", None)
+    cache_read = int(getattr(usage, "cache_read_input_tokens", None) or 0)
+    cache_create = int(getattr(usage, "cache_creation_input_tokens", None) or 0)
+    if input_tokens is not None:
+        fields["input_tokens"] = int(input_tokens) + cache_read + cache_create
+    if output_tokens is not None:
+        fields["output_tokens"] = int(output_tokens)
+    put_if_positive(fields, "cached_input_tokens", cache_read)
+    put_if_positive(fields, "cache_creation_input_tokens", cache_create)
+    return fields
+
+
+def _count_tool_uses(content: Any) -> int:
+    count = 0
+    for block in content or []:
+        if getattr(block, "type", None) == "tool_use" or (
+            isinstance(block, dict) and block.get("type") == "tool_use"
+        ):
+            count += 1
+    return count
+
+
+def _build_payload(response: Any, latency: int, stream: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "anthropic",
-        "latency_ms": latency_ms,
+        "latency_ms": latency,
     }
     model = getattr(response, "model", None)
     if model:
         payload["model"] = model
-
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        input_tokens = getattr(usage, "input_tokens", None)
-        output_tokens = getattr(usage, "output_tokens", None)
-        cache_read = getattr(usage, "cache_read_input_tokens", None)
-        cache_create = getattr(usage, "cache_creation_input_tokens", None)
-        if input_tokens is not None:
-            payload["input_tokens"] = int(input_tokens)
-        if output_tokens is not None:
-            payload["output_tokens"] = int(output_tokens)
-        if cache_read:
-            payload["cached_input_tokens"] = int(cache_read)
-        if cache_create:
-            payload["cache_creation_input_tokens"] = int(cache_create)
-
+    payload.update(_usage_fields(getattr(response, "usage", None)))
+    put_if_str(payload, "finish_reason", getattr(response, "stop_reason", None))
+    put_if_positive(payload, "tool_calls", _count_tool_uses(getattr(response, "content", None)))
+    if stream:
+        payload["stream"] = True
     return payload
+
+
+class _EventAccumulator:
+    """Builds the llm_call payload from raw `stream=True` events.
+
+    Usage arrives in two places: `message_start` carries the input side and
+    `message_delta` carries the cumulative output side, so the last delta
+    wins rather than being summed.
+    """
+
+    def __init__(self, model: str | None) -> None:
+        self.model = model
+        self.usage: dict[str, int] = {}
+        self.finish_reason: str | None = None
+        self.tool_calls = 0
+
+    def observe(self, event: Any) -> None:
+        kind = getattr(event, "type", None)
+        if kind == "message_start":
+            message = getattr(event, "message", None)
+            self.model = getattr(message, "model", None) or self.model
+            usage = getattr(message, "usage", None)
+            self._merge_usage(usage)
+        elif kind == "message_delta":
+            self._merge_usage(getattr(event, "usage", None))
+            delta = getattr(event, "delta", None)
+            stop = getattr(delta, "stop_reason", None)
+            if stop:
+                self.finish_reason = stop
+        elif kind == "content_block_start":
+            block = getattr(event, "content_block", None)
+            if getattr(block, "type", None) == "tool_use":
+                self.tool_calls += 1
+
+    def _merge_usage(self, usage: Any) -> None:
+        if usage is None:
+            return
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            value = getattr(usage, key, None)
+            if value is not None:
+                self.usage[key] = int(value)
+
+    def payload(self, start: float) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "provider": "anthropic",
+            "model": self.model or "unknown",
+            "latency_ms": latency_ms(start),
+            "stream": True,
+        }
+        if self.usage:
+            payload.update(_usage_fields(SimpleNamespace(**self.usage)))
+        put_if_str(payload, "finish_reason", self.finish_reason)
+        put_if_positive(payload, "tool_calls", self.tool_calls)
+        return payload
+
+
+def _wrap_stream(result: Any, model: str | None, start: float, is_async: bool) -> Any:
+    acc = _EventAccumulator(model)
+
+    def on_complete() -> None:
+        emit_llm_call(acc.payload(start))
+
+    def on_error(exc: BaseException) -> None:
+        emit_errored_llm_call("anthropic", acc.model, start, exc, {"stream": True})
+
+    proxy = AsyncStreamProxy if is_async else StreamProxy
+    return proxy(result, acc.observe, on_complete, on_error)
+
+
+class _StreamManagerProxy:
+    """Wraps `messages.stream(...)`'s context manager.
+
+    The SDK's MessageStream keeps an accumulated `current_message_snapshot`,
+    so on exit we can read the final usage, stop reason and tool uses without
+    consuming anything the caller did not.
+    """
+
+    def __init__(self, inner: Any, model: str | None, start: float) -> None:
+        self._inner = inner
+        self._model = model
+        self._start = start
+        self._stream: Any = None
+
+    def __enter__(self) -> Any:
+        self._stream = self._inner.__enter__()
+        return self._stream
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        self._emit(exc)
+        return self._inner.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def _emit(self, exc: Any) -> None:
+        try:
+            snapshot = None
+            if self._stream is not None:
+                try:
+                    snapshot = self._stream.current_message_snapshot
+                except Exception:
+                    snapshot = None
+            if exc is not None and snapshot is None:
+                emit_errored_llm_call("anthropic", self._model, self._start, exc, {"stream": True})
+                return
+            if snapshot is None:
+                return
+            payload = _build_payload(snapshot, latency_ms(self._start), stream=True)
+            if not payload.get("model"):
+                payload["model"] = self._model or "unknown"
+            emit_llm_call(payload)
+        except Exception:
+            pass
+
+
+class _AsyncStreamManagerProxy(_StreamManagerProxy):
+    async def __aenter__(self) -> Any:
+        self._stream = await self._inner.__aenter__()
+        return self._stream
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        self._emit(exc)
+        return await self._inner.__aexit__(exc_type, exc, tb)
 
 
 def instrument() -> None:
@@ -95,11 +248,16 @@ def instrument() -> None:
 
     def patched_create(self: Any, *args: Any, **kwargs: Any) -> Any:
         start = time.monotonic()
-        result = original_create(self, *args, **kwargs)
-        latency_ms = int((time.monotonic() - start) * 1000)
+        model = kwargs.get("model")
         try:
-            payload = _build_payload(result, latency_ms)
-            emit_llm_call(payload)
+            result = original_create(self, *args, **kwargs)
+        except BaseException as exc:
+            emit_errored_llm_call("anthropic", model, start, exc)
+            raise
+        if kwargs.get("stream"):
+            return _wrap_stream(result, model, start, is_async=False)
+        try:
+            emit_llm_call(_build_payload(result, latency_ms(start)))
         except Exception:
             pass
         return result
@@ -107,44 +265,84 @@ def instrument() -> None:
     Messages.create = patched_create
     Messages._agentping_original_create = original_create
 
+    original_stream = getattr(Messages, "stream", None)
+    if original_stream is not None:
+
+        def patched_stream(self: Any, *args: Any, **kwargs: Any) -> Any:
+            start = time.monotonic()
+            model = kwargs.get("model")
+            try:
+                manager = original_stream(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("anthropic", model, start, exc, {"stream": True})
+                raise
+            return _StreamManagerProxy(manager, model, start)
+
+        Messages.stream = patched_stream
+        Messages._agentping_original_stream = original_stream
+
     try:
         from anthropic.resources.messages import AsyncMessages
+
         async_original = AsyncMessages.create
 
         async def patched_async_create(self: Any, *args: Any, **kwargs: Any) -> Any:
             start = time.monotonic()
-            result = await async_original(self, *args, **kwargs)
-            latency_ms = int((time.monotonic() - start) * 1000)
+            model = kwargs.get("model")
             try:
-                payload = _build_payload(result, latency_ms)
-                emit_llm_call(payload)
+                result = await async_original(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("anthropic", model, start, exc)
+                raise
+            if kwargs.get("stream"):
+                return _wrap_stream(result, model, start, is_async=True)
+            try:
+                emit_llm_call(_build_payload(result, latency_ms(start)))
             except Exception:
                 pass
             return result
 
         AsyncMessages.create = patched_async_create
         AsyncMessages._agentping_original_create = async_original
+
+        async_original_stream = getattr(AsyncMessages, "stream", None)
+        if async_original_stream is not None:
+
+            def patched_async_stream(self: Any, *args: Any, **kwargs: Any) -> Any:
+                start = time.monotonic()
+                model = kwargs.get("model")
+                try:
+                    manager = async_original_stream(self, *args, **kwargs)
+                except BaseException as exc:
+                    emit_errored_llm_call("anthropic", model, start, exc, {"stream": True})
+                    raise
+                return _AsyncStreamManagerProxy(manager, model, start)
+
+            AsyncMessages.stream = patched_async_stream
+            AsyncMessages._agentping_original_stream = async_original_stream
     except Exception:
         pass
 
     _PATCHED = True
 
 
+def _restore(cls: Any, name: str) -> None:
+    saved = f"_agentping_original_{name}"
+    if hasattr(cls, saved):
+        setattr(cls, name, getattr(cls, saved))
+        delattr(cls, saved)
+
+
 def uninstrument() -> None:
     """For tests: undo the patch."""
     global _PATCHED
-    try:
-        from anthropic.resources.messages import Messages
-        if hasattr(Messages, "_agentping_original_create"):
-            Messages.create = Messages._agentping_original_create
-            delattr(Messages, "_agentping_original_create")
-    except Exception:
-        pass
-    try:
-        from anthropic.resources.messages import AsyncMessages
-        if hasattr(AsyncMessages, "_agentping_original_create"):
-            AsyncMessages.create = AsyncMessages._agentping_original_create
-            delattr(AsyncMessages, "_agentping_original_create")
-    except Exception:
-        pass
+    for path in ("anthropic.resources.messages",):
+        for cls_name in ("Messages", "AsyncMessages"):
+            try:
+                module = __import__(path, fromlist=[cls_name])
+                cls = getattr(module, cls_name)
+            except Exception:
+                continue
+            _restore(cls, "create")
+            _restore(cls, "stream")
     _PATCHED = False

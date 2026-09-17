@@ -97,13 +97,21 @@ class Run:
         self._active_token = set_active_run(self)
         return self
 
+    def _fail_with(self, exc: BaseException) -> None:
+        """An unhandled exception inside the `with` block lands as an
+        `error` event on the timeline, then the run finishes failed."""
+        from .instrumentation._shared import error_fields
+        fields = error_fields(exc)
+        self.event("error", {"message": fields["error"], "exception": fields["exception"]})
+        self.finish(status="failed", output={"error": repr(exc)})
+
     def __exit__(self, exc_type, exc, tb) -> None:
         from .instrumentation._streaming import reset_active_run
         reset_active_run(getattr(self, "_active_token", None))
         if self._finished:
             return
-        if exc_type is not None:
-            self.finish(status="failed", output={"error": repr(exc)})
+        if exc is not None:
+            self._fail_with(exc)
         else:
             self.finish(status="success")
 
@@ -117,7 +125,7 @@ class Run:
         reset_active_run(getattr(self, "_active_token", None))
         if self._finished:
             return
-        if exc_type is not None:
-            self.finish(status="failed", output={"error": repr(exc)})
+        if exc is not None:
+            self._fail_with(exc)
         else:
             self.finish(status="success")

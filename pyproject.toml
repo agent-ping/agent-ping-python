@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentping-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Production observability for AI agents: cost attribution, live monitoring, quality scoring."
 readme = "README.md"
 license = { text = "MIT" }

@@ -1,7 +1,10 @@
 """Mistral SDK instrumentation.
 
-Wraps `mistralai.client.chat.Chat.complete` and `Chat.complete_async`. On
-a successful response, emit an `llm_call` event to the active run.
+Wraps `mistralai.client.chat.Chat.complete`, `complete_async`, `stream` and
+`stream_async`. Every call emits one `llm_call` to the active run: on
+success with token usage, `finish_reason` and the number of tool calls; on
+failure with `status: "error"` and the exception class, after which the
+exception is re-raised.
 """
 
 from __future__ import annotations
@@ -10,7 +13,8 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._streaming import emit_llm_call
+from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._streaming import AsyncStreamProxy, StreamProxy, emit_llm_call
 
 _PATCHED = False
 _SUPPORTED_RANGE = ">=2.0.0,<3.0.0"
@@ -24,33 +28,94 @@ def _version_supported(version: str) -> bool:
     return major == 2
 
 
-def _build_payload(response: Any, model: str | None, latency_ms: int) -> dict[str, Any]:
+def _usage_fields(usage: Any) -> dict[str, Any]:
+    if usage is None:
+        return {}
+    fields: dict[str, Any] = {}
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if prompt is not None:
+        fields["input_tokens"] = int(prompt)
+    if completion is not None:
+        fields["output_tokens"] = int(completion)
+    return fields
+
+
+def _build_payload(response: Any, model: str | None, latency: int, stream: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "mistral",
-        "latency_ms": latency_ms,
+        "latency_ms": latency,
     }
     resolved_model = model or getattr(response, "model", None)
     if resolved_model:
         payload["model"] = resolved_model
-
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        prompt = getattr(usage, "prompt_tokens", None)
-        completion = getattr(usage, "completion_tokens", None)
-        if prompt is not None:
-            payload["input_tokens"] = int(prompt)
-        if completion is not None:
-            payload["output_tokens"] = int(completion)
-
+    payload.update(_usage_fields(getattr(response, "usage", None)))
+    choices = getattr(response, "choices", None) or []
+    if choices:
+        first = choices[0]
+        put_if_str(payload, "finish_reason", getattr(first, "finish_reason", None))
+        message = getattr(first, "message", None)
+        put_if_positive(payload, "tool_calls", len(getattr(message, "tool_calls", None) or []))
+    if stream:
+        payload["stream"] = True
     return payload
 
 
 def _detect_version() -> str:
     try:
         from importlib.metadata import version
+
         return version("mistralai")
     except Exception:
         return ""
+
+
+class _EventAccumulator:
+    """chat.stream() yields CompletionEvent objects; the final one carries usage on .data."""
+
+    def __init__(self, model: str | None) -> None:
+        self.model = model
+        self.usage: Any = None
+        self.finish_reason: str | None = None
+        self.tool_calls = 0
+
+    def observe(self, event: Any) -> None:
+        data = getattr(event, "data", event)
+        usage = getattr(data, "usage", None)
+        if usage is not None:
+            self.usage = usage
+        self.model = getattr(data, "model", None) or self.model
+        for choice in getattr(data, "choices", None) or []:
+            finish = getattr(choice, "finish_reason", None)
+            if finish:
+                self.finish_reason = finish
+            delta = getattr(choice, "delta", None)
+            self.tool_calls += len(getattr(delta, "tool_calls", None) or [])
+
+    def payload(self, start: float) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "provider": "mistral",
+            "model": self.model or "unknown",
+            "latency_ms": latency_ms(start),
+            "stream": True,
+        }
+        payload.update(_usage_fields(self.usage))
+        put_if_str(payload, "finish_reason", self.finish_reason)
+        put_if_positive(payload, "tool_calls", self.tool_calls)
+        return payload
+
+
+def _wrap_stream(iterator: Any, model: str | None, start: float, is_async: bool) -> Any:
+    acc = _EventAccumulator(model)
+
+    def on_complete() -> None:
+        emit_llm_call(acc.payload(start))
+
+    def on_error(exc: BaseException) -> None:
+        emit_errored_llm_call("mistral", acc.model, start, exc, {"stream": True})
+
+    proxy = AsyncStreamProxy if is_async else StreamProxy
+    return proxy(iterator, acc.observe, on_complete, on_error)
 
 
 def instrument() -> None:
@@ -89,11 +154,13 @@ def instrument() -> None:
     def patched_complete(self: Any, *args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model")
         start = time.monotonic()
-        result = original_complete(self, *args, **kwargs)
-        latency_ms = int((time.monotonic() - start) * 1000)
         try:
-            payload = _build_payload(result, model, latency_ms)
-            emit_llm_call(payload)
+            result = original_complete(self, *args, **kwargs)
+        except BaseException as exc:
+            emit_errored_llm_call("mistral", model, start, exc)
+            raise
+        try:
+            emit_llm_call(_build_payload(result, model, latency_ms(start)))
         except Exception:
             pass
         return result
@@ -107,11 +174,13 @@ def instrument() -> None:
         async def patched_complete_async(self: Any, *args: Any, **kwargs: Any) -> Any:
             model = kwargs.get("model")
             start = time.monotonic()
-            result = await async_original(self, *args, **kwargs)
-            latency_ms = int((time.monotonic() - start) * 1000)
             try:
-                payload = _build_payload(result, model, latency_ms)
-                emit_llm_call(payload)
+                result = await async_original(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("mistral", model, start, exc)
+                raise
+            try:
+                emit_llm_call(_build_payload(result, model, latency_ms(start)))
             except Exception:
                 pass
             return result
@@ -119,69 +188,51 @@ def instrument() -> None:
         Chat.complete_async = patched_complete_async
         Chat._agentping_original_complete_async = async_original
 
-    # stream (sync): chat.stream() yields CompletionEvent objects; the
-    # final event carries usage on its .data attribute.
     if hasattr(Chat, "stream"):
         stream_original = Chat.stream
 
         def patched_stream(self: Any, *args: Any, **kwargs: Any) -> Any:
             model = kwargs.get("model")
             start = time.monotonic()
-            iterator = stream_original(self, *args, **kwargs)
-            return _wrap_stream_iterator(iterator, model, start)
+            try:
+                iterator = stream_original(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("mistral", model, start, exc, {"stream": True})
+                raise
+            return _wrap_stream(iterator, model, start, is_async=False)
 
         Chat.stream = patched_stream
         Chat._agentping_original_stream = stream_original
 
-    _PATCHED = True
+    if hasattr(Chat, "stream_async"):
+        stream_async_original = Chat.stream_async
 
-
-def _wrap_stream_iterator(iterator: Any, model: str | None, start: float) -> Any:
-    """Wrap a Mistral streaming iterator: pass events through, capture final usage."""
-
-    def gen():
-        last_usage = None
-        last_model = model
-        try:
-            for event in iterator:
-                data = getattr(event, "data", event)
-                usage = getattr(data, "usage", None)
-                if usage is not None:
-                    last_usage = usage
-                event_model = getattr(data, "model", None)
-                if event_model:
-                    last_model = event_model
-                yield event
-        finally:
-            latency_ms = int((time.monotonic() - start) * 1000)
+        async def patched_stream_async(self: Any, *args: Any, **kwargs: Any) -> Any:
+            model = kwargs.get("model")
+            start = time.monotonic()
             try:
-                if last_usage is not None:
-                    prompt = getattr(last_usage, "prompt_tokens", None)
-                    completion = getattr(last_usage, "completion_tokens", None)
-                    payload: dict[str, Any] = {
-                        "provider": "mistral",
-                        "model": last_model or "unknown",
-                        "latency_ms": latency_ms,
-                    }
-                    if prompt is not None:
-                        payload["input_tokens"] = int(prompt)
-                    if completion is not None:
-                        payload["output_tokens"] = int(completion)
-                    emit_llm_call(payload)
-            except Exception:
-                pass
+                iterator = await stream_async_original(self, *args, **kwargs)
+            except BaseException as exc:
+                emit_errored_llm_call("mistral", model, start, exc, {"stream": True})
+                raise
+            return _wrap_stream(iterator, model, start, is_async=True)
 
-    return gen()
+        Chat.stream_async = patched_stream_async
+        Chat._agentping_original_stream_async = stream_async_original
+
+    _PATCHED = True
 
 
 def uninstrument() -> None:
     global _PATCHED
     try:
         from mistralai.client.chat import Chat
+
         for attr, original in (
             ("_agentping_original_complete", "complete"),
             ("_agentping_original_complete_async", "complete_async"),
             ("_agentping_original_stream", "stream"),
+            ("_agentping_original_stream_async", "stream_async"),
         ):
             if hasattr(Chat, attr):
                 setattr(Chat, original, getattr(Chat, attr))

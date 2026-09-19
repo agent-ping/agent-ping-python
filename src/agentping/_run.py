@@ -65,18 +65,25 @@ class Run:
 
         _state.enqueue("/v1/runs", body)
 
-    def event(self, type: str, data: dict[str, Any] | None = None) -> str:
+    def event(self, type: str, data: dict[str, Any] | None = None, turn: int | None = None) -> str:
+        """Append an event to the run.
+
+        Args:
+            turn: Which exchange of a conversation this belongs to, counting from
+                1. One turn is often several events -- call the model, run a tool,
+                call it again -- and this is what groups them. Omit for work that
+                is not a conversation.
+        """
         evt_id = _ids.new_id("evt", self._region)
-        body = {
-            "events": [
-                {
-                    "external_id": evt_id,
-                    "type": type,
-                    "ts": _iso(),
-                    "data": data or {},
-                }
-            ]
+        entry: dict[str, Any] = {
+            "external_id": evt_id,
+            "type": type,
+            "ts": _iso(),
+            "data": data or {},
         }
+        if turn is not None:
+            entry["turn"] = turn
+        body = {"events": [entry]}
         _state.enqueue(f"/v1/runs/{self.id}/events", body)
         return evt_id
 

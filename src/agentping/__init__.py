@@ -35,7 +35,7 @@ from .guard import GuardVerdict, Paused
 
 _SESSION_RE = re.compile(r"[0-9a-f]{32}")
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "init",
@@ -69,13 +69,31 @@ def init(
     queue_size: int = _state.DEFAULT_QUEUE_SIZE,
     transport: httpx.BaseTransport | None = None,
     control_url: str | None = None,
+    version: str | None = None,
+    capture_llm_content: bool = False,
+    llm_content_max_chars: int = _state.DEFAULT_LLM_CONTENT_MAX_CHARS,
 ) -> None:
+    """Configure the SDK.
+
+    Args:
+        version: The build or prompt version this process runs, applied to
+            every run that does not set its own (``AGENTPING_VERSION`` also
+            works). The dashboard marks where each new version was first seen.
+        capture_llm_content: Send prompt and completion text on the
+            ``llm_call`` events auto-instrumentation emits (``input``,
+            ``output``, ``system_instructions``). Off by default: turn it on
+            only when your prompts may leave your infrastructure.
+        llm_content_max_chars: Truncate each captured piece at this length.
+    """
     _state.init(
         api_key=api_key,
         base_url=base_url,
         queue_size=queue_size,
         transport=transport,
         control_url=control_url,
+        version=version,
+        capture_llm_content=capture_llm_content,
+        llm_content_max_chars=llm_content_max_chars,
     )
 
 
@@ -86,6 +104,7 @@ def run(
     metadata: dict[str, Any] | None = None,
     parent_run_id: str | None = None,
     goal: str | None = None,
+    version: str | None = None,
 ) -> Run:
     return Run(
         agent=agent,
@@ -94,6 +113,7 @@ def run(
         metadata=metadata,
         parent_run_id=parent_run_id,
         goal=goal,
+        version=version,
     )
 
 
@@ -111,6 +131,7 @@ def conversation(
     feature: str | None = None,
     metadata: dict[str, Any] | None = None,
     goal: str | None = None,
+    version: str | None = None,
 ) -> Run:
     """One chat session as one run, with every turn appended to it.
 
@@ -150,6 +171,7 @@ def conversation(
         feature=feature,
         metadata=metadata,
         goal=goal,
+        version=version,
         idle_timeout_seconds=idle_timeout_seconds,
         idle_timeout_status=idle_timeout_status,
         resume=(f"run_{region}_{session_id}", started_at),

@@ -34,7 +34,7 @@ class Client:
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "agentping-python/0.1.0",
+                "User-Agent": "agentping-python/0.3.0",
             },
         )
 

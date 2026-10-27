@@ -29,6 +29,7 @@ class Run:
         idle_timeout_seconds: int | None = None,
         idle_timeout_status: str | None = None,
         resume: tuple[str, str] | None = None,
+        version: str | None = None,
     ) -> None:
         s = _state.state()
         region = s.region or "eu"
@@ -38,6 +39,8 @@ class Run:
         self.customer_id = customer_id
         self.feature = feature
         self.goal = goal
+        # A run's own version beats the init()-level default.
+        self.version: str | None = (version if version is not None else s.version).strip() or None
         self.metadata = metadata or {}
         self.parent_run_id = parent_run_id or os.environ.get("AGENTPING_PARENT_RUN")
         self.started_at = resume[1] if resume else _iso()
@@ -54,6 +57,8 @@ class Run:
             body["feature"] = feature
         if goal is not None:
             body["goal"] = goal
+        if self.version is not None:
+            body["version"] = self.version
         if metadata:
             body["metadata"] = metadata
         if self.parent_run_id:

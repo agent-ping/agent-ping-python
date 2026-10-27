@@ -83,6 +83,19 @@ not against one run that passes the check and then loops forever. Drop
 `guard.check(...)` at several points (top of a loop, between phases) to turn it
 into a series of gates. Thresholds are set in USD.
 
+## Run options
+
+```python
+agentping.init(api_key="apk_eu_...", version="2026.10.27")   # default for every run
+run = agentping.run("support-triage", customer_id="cust_123", feature="routing",
+                    goal="Answer the ticket", version="prompt-v7")   # per-run override
+```
+
+`version` is the build or prompt version that produced the run. The Spend and
+Verify charts mark the bucket where each agent's new version was first seen, so
+a cost or score shift reads against the deploy that preceded it.
+`AGENTPING_VERSION` sets the default without code.
+
 ## Auto-instrumentation
 
 One-line patches for each supported provider and framework. Calls made
@@ -145,6 +158,13 @@ Agents handoffs and agent boundaries arrive as `step` events.
 Per-integration docs:
 [Anthropic](https://agentping.io/docs/providers/anthropic) ·
 [OpenAI](https://agentping.io/docs/providers/openai) ·
+
+Prompt and completion text are off by default. Turn them on with
+`agentping.init(capture_llm_content=True)` and auto-instrumented Anthropic and
+OpenAI calls add `input` (a list of `{role, content}` messages), `output` and
+`system_instructions` to each `llm_call`, each clipped at
+`llm_content_max_chars` (default 4000). The run page shows them as messages.
+Streamed calls also report `ttft_ms`, the time to the first content chunk.
 [Gemini](https://agentping.io/docs/providers/gemini) ·
 [Mistral](https://agentping.io/docs/providers/mistral) ·
 [Cohere](https://agentping.io/docs/providers/cohere) ·

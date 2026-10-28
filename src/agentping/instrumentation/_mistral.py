@@ -5,6 +5,11 @@ Wraps `mistralai.client.chat.Chat.complete`, `complete_async`, `stream` and
 success with token usage, `finish_reason` and the number of tool calls; on
 failure with `status: "error"` and the exception class, after which the
 exception is re-raised.
+
+Streams report `ttft_ms` from the first delta carrying content or a tool
+call. With `init(capture_llm_content=True)` the call also carries
+`messages` as `input` (system messages included, as the API takes them)
+and the first choice's text as `output`.
 """
 
 from __future__ import annotations
@@ -13,7 +18,16 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._shared import (
+    FirstChunkClock,
+    content_capture_enabled,
+    emit_errored_llm_call,
+    latency_ms,
+    message_text,
+    put_content,
+    put_if_positive,
+    put_if_str,
+)
 from ._streaming import AsyncStreamProxy, StreamProxy, emit_llm_call
 
 _PATCHED = False
@@ -41,7 +55,9 @@ def _usage_fields(usage: Any) -> dict[str, Any]:
     return fields
 
 
-def _build_payload(response: Any, model: str | None, latency: int, stream: bool = False) -> dict[str, Any]:
+def _build_payload(
+    response: Any, model: str | None, latency: int, stream: bool = False, request: dict[str, Any] | None = None
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "mistral",
         "latency_ms": latency,
@@ -51,13 +67,17 @@ def _build_payload(response: Any, model: str | None, latency: int, stream: bool 
         payload["model"] = resolved_model
     payload.update(_usage_fields(getattr(response, "usage", None)))
     choices = getattr(response, "choices", None) or []
+    output = ""
     if choices:
         first = choices[0]
         put_if_str(payload, "finish_reason", getattr(first, "finish_reason", None))
         message = getattr(first, "message", None)
         put_if_positive(payload, "tool_calls", len(getattr(message, "tool_calls", None) or []))
+        output = message_text(getattr(message, "content", None))
     if stream:
         payload["stream"] = True
+    request = request or {}
+    put_content(payload, input=request.get("messages"), output=output)
     return payload
 
 
@@ -70,14 +90,17 @@ def _detect_version() -> str:
         return ""
 
 
-class _EventAccumulator:
+class _EventAccumulator(FirstChunkClock):
     """chat.stream() yields CompletionEvent objects; the final one carries usage on .data."""
 
-    def __init__(self, model: str | None) -> None:
+    def __init__(self, model: str | None, request: dict[str, Any] | None = None) -> None:
         self.model = model
         self.usage: Any = None
         self.finish_reason: str | None = None
         self.tool_calls = 0
+        self.request = request or {}
+        self.text: list[str] = []
+        self.capture = content_capture_enabled()
 
     def observe(self, event: Any) -> None:
         data = getattr(event, "data", event)
@@ -90,7 +113,13 @@ class _EventAccumulator:
             if finish:
                 self.finish_reason = finish
             delta = getattr(choice, "delta", None)
-            self.tool_calls += len(getattr(delta, "tool_calls", None) or [])
+            tool_calls = getattr(delta, "tool_calls", None) or []
+            self.tool_calls += len(tool_calls)
+            content = getattr(delta, "content", None)
+            if content or tool_calls:
+                self.mark_content()
+            if self.capture and content:
+                self.text.append(message_text(content))
 
     def payload(self, start: float) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -102,11 +131,15 @@ class _EventAccumulator:
         payload.update(_usage_fields(self.usage))
         put_if_str(payload, "finish_reason", self.finish_reason)
         put_if_positive(payload, "tool_calls", self.tool_calls)
+        self.put_ttft(payload, start)
+        put_content(payload, input=self.request.get("messages"), output="".join(self.text))
         return payload
 
 
-def _wrap_stream(iterator: Any, model: str | None, start: float, is_async: bool) -> Any:
-    acc = _EventAccumulator(model)
+def _wrap_stream(
+    iterator: Any, model: str | None, start: float, is_async: bool, request: dict[str, Any] | None = None
+) -> Any:
+    acc = _EventAccumulator(model, request)
 
     def on_complete() -> None:
         emit_llm_call(acc.payload(start))
@@ -160,7 +193,7 @@ def instrument() -> None:
             emit_errored_llm_call("mistral", model, start, exc)
             raise
         try:
-            emit_llm_call(_build_payload(result, model, latency_ms(start)))
+            emit_llm_call(_build_payload(result, model, latency_ms(start), request=kwargs))
         except Exception:
             pass
         return result
@@ -180,7 +213,7 @@ def instrument() -> None:
                 emit_errored_llm_call("mistral", model, start, exc)
                 raise
             try:
-                emit_llm_call(_build_payload(result, model, latency_ms(start)))
+                emit_llm_call(_build_payload(result, model, latency_ms(start), request=kwargs))
             except Exception:
                 pass
             return result
@@ -199,7 +232,7 @@ def instrument() -> None:
             except BaseException as exc:
                 emit_errored_llm_call("mistral", model, start, exc, {"stream": True})
                 raise
-            return _wrap_stream(iterator, model, start, is_async=False)
+            return _wrap_stream(iterator, model, start, is_async=False, request=kwargs)
 
         Chat.stream = patched_stream
         Chat._agentping_original_stream = stream_original
@@ -215,7 +248,7 @@ def instrument() -> None:
             except BaseException as exc:
                 emit_errored_llm_call("mistral", model, start, exc, {"stream": True})
                 raise
-            return _wrap_stream(iterator, model, start, is_async=True)
+            return _wrap_stream(iterator, model, start, is_async=True, request=kwargs)
 
         Chat.stream_async = patched_stream_async
         Chat._agentping_original_stream_async = stream_async_original

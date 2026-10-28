@@ -6,6 +6,11 @@ counts from `usage.billed_units` (what the user pays for) rather than the
 raw `tokens` block, plus `finish_reason` and the number of tool calls; on
 failure with `status: "error"` and the exception class, after which the
 exception is re-raised.
+
+Streams report `ttft_ms` from the first content or tool-call event. With
+`init(capture_llm_content=True)` the call also carries `messages` as
+`input` (system messages included, as the API takes them) and the
+response's text as `output`.
 """
 
 from __future__ import annotations
@@ -14,7 +19,16 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._shared import (
+    FirstChunkClock,
+    content_capture_enabled,
+    emit_errored_llm_call,
+    latency_ms,
+    message_text,
+    put_content,
+    put_if_positive,
+    put_if_str,
+)
 from ._streaming import AsyncStreamProxy, StreamProxy, emit_llm_call
 
 _PATCHED = False
@@ -42,7 +56,9 @@ def _billed_fields(billed: Any) -> dict[str, Any]:
     return fields
 
 
-def _build_payload(response: Any, model: str | None, latency: int, stream: bool = False) -> dict[str, Any]:
+def _build_payload(
+    response: Any, model: str | None, latency: int, stream: bool = False, request: dict[str, Any] | None = None
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "cohere",
         "latency_ms": latency,
@@ -56,6 +72,8 @@ def _build_payload(response: Any, model: str | None, latency: int, stream: bool 
     put_if_positive(payload, "tool_calls", len(getattr(message, "tool_calls", None) or []))
     if stream:
         payload["stream"] = True
+    request = request or {}
+    put_content(payload, input=request.get("messages"), output=message_text(getattr(message, "content", None)))
     return payload
 
 
@@ -79,18 +97,34 @@ def _build_embed_payload(response: Any, model: str | None, latency: int) -> dict
     return payload
 
 
-class _EventAccumulator:
-    """The terminal `message-end` event carries delta.usage.billed_units and
-    delta.finish_reason; each `tool-call-start` is one tool call."""
+_CONTENT_EVENTS = {"content-start", "content-delta", "tool-plan-delta", "tool-call-start", "tool-call-delta"}
 
-    def __init__(self, model: str | None) -> None:
+
+class _EventAccumulator(FirstChunkClock):
+    """The terminal `message-end` event carries delta.usage.billed_units and
+    delta.finish_reason; each `tool-call-start` is one tool call; each
+    `content-delta` carries a piece of the reply text."""
+
+    def __init__(self, model: str | None, request: dict[str, Any] | None = None) -> None:
         self.model = model
         self.billed: Any = None
         self.finish_reason: str | None = None
         self.tool_calls = 0
+        self.request = request or {}
+        self.text: list[str] = []
+        self.capture = content_capture_enabled()
 
     def observe(self, event: Any) -> None:
         event_type = getattr(event, "type", None)
+        if event_type in _CONTENT_EVENTS:
+            self.mark_content()
+        if event_type == "content-delta" and self.capture:
+            delta = getattr(event, "delta", None)
+            message = getattr(delta, "message", None) if delta is not None else None
+            content = getattr(message, "content", None) if message is not None else None
+            text = getattr(content, "text", None) if content is not None else None
+            if isinstance(text, str):
+                self.text.append(text)
         if event_type == "message-end":
             delta = getattr(event, "delta", None)
             usage = getattr(delta, "usage", None) if delta is not None else None
@@ -113,11 +147,15 @@ class _EventAccumulator:
         payload.update(_billed_fields(self.billed))
         put_if_str(payload, "finish_reason", self.finish_reason)
         put_if_positive(payload, "tool_calls", self.tool_calls)
+        self.put_ttft(payload, start)
+        put_content(payload, input=self.request.get("messages"), output="".join(self.text))
         return payload
 
 
-def _wrap_stream(iterator: Any, model: str | None, start: float, is_async: bool) -> Any:
-    acc = _EventAccumulator(model)
+def _wrap_stream(
+    iterator: Any, model: str | None, start: float, is_async: bool, request: dict[str, Any] | None = None
+) -> Any:
+    acc = _EventAccumulator(model, request)
 
     def on_complete() -> None:
         emit_llm_call(acc.payload(start))
@@ -172,7 +210,7 @@ def instrument() -> None:
             emit_errored_llm_call("cohere", model, start, exc)
             raise
         try:
-            emit_llm_call(_build_payload(result, model, latency_ms(start)))
+            emit_llm_call(_build_payload(result, model, latency_ms(start), request=kwargs))
         except Exception:
             pass
         return result
@@ -191,7 +229,7 @@ def instrument() -> None:
             except BaseException as exc:
                 emit_errored_llm_call("cohere", model, start, exc, {"stream": True})
                 raise
-            return _wrap_stream(iterator, model, start, is_async=False)
+            return _wrap_stream(iterator, model, start, is_async=False, request=kwargs)
 
         ClientV2.chat_stream = patched_chat_stream
         ClientV2._agentping_original_chat_stream = stream_original
@@ -228,7 +266,7 @@ def instrument() -> None:
                 emit_errored_llm_call("cohere", model, start, exc)
                 raise
             try:
-                emit_llm_call(_build_payload(result, model, latency_ms(start)))
+                emit_llm_call(_build_payload(result, model, latency_ms(start), request=kwargs))
             except Exception:
                 pass
             return result
@@ -247,7 +285,7 @@ def instrument() -> None:
                 except BaseException as exc:
                     emit_errored_llm_call("cohere", model, start, exc, {"stream": True})
                     raise
-                return _wrap_stream(iterator, model, start, is_async=True)
+                return _wrap_stream(iterator, model, start, is_async=True, request=kwargs)
 
             AsyncClientV2.chat_stream = patched_async_chat_stream
             AsyncClientV2._agentping_original_chat_stream = async_stream_original

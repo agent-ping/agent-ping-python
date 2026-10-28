@@ -11,6 +11,12 @@ event, and exception inside a LlamaIndex pipeline. Attach via:
 
 Constructor argument `run` is optional. When omitted the handler
 resolves the active run via the ContextVar set by `agentping.run(...)`.
+
+With `agentping.init(capture_llm_content=True)` each LLM `llm_call` also
+carries `input` (the chat messages as `{role, content}`, or the formatted
+prompt of a completion call), `system_instructions` (the system messages)
+and `output` (the response text). The callback manager reports a stream
+only once it has finished, so there is no `ttft_ms` here.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._shared import error_fields
+from ._shared import error_fields, message_text, put_content
 from ._streaming import _active_run, emit_llm_call
 
 
@@ -177,6 +183,17 @@ def _make_handler_class() -> Any:
             if usage.get("cached_input_tokens"):
                 data["cached_input_tokens"] = int(usage["cached_input_tokens"])
 
+            # Chat calls end with MESSAGES + RESPONSE, completion calls with
+            # PROMPT + COMPLETION.
+            prompt = payload.get(EventPayload.PROMPT)
+            rendered, system = self._convert_messages(messages)
+            put_content(
+                data,
+                input=rendered if messages is not None else (prompt if isinstance(prompt, str) else None),
+                system=system,
+                output=self._output_text(response if response is not None else payload.get(EventPayload.COMPLETION)),
+            )
+
             emit_llm_call(data)
 
         def _emit_embedding(self, payload: dict | None, latency_ms: int, requested_model: str | None) -> None:
@@ -208,6 +225,50 @@ def _make_handler_class() -> Any:
                 "output_tokens": 0,
             }
             emit_llm_call(data)
+
+        @staticmethod
+        def _convert_messages(messages: Any) -> tuple[list[dict[str, str]] | None, str | None]:
+            """LlamaIndex ChatMessages (`role` is a MessageRole enum, text in
+            `content` or `blocks`) as [{role, content}], with the system
+            messages split off."""
+            if messages is None:
+                return None, None
+            rendered: list[dict[str, str]] = []
+            system: list[str] = []
+            for message in messages or []:
+                if isinstance(message, str):
+                    rendered.append({"role": "user", "content": message})
+                    continue
+                role = getattr(message, "role", None)
+                role = getattr(role, "value", role)
+                role = role if isinstance(role, str) and role else "user"
+                content = getattr(message, "content", None)
+                if content is None:
+                    content = getattr(message, "blocks", None)
+                text = message_text(content)
+                if role == "system":
+                    if text:
+                        system.append(text)
+                    continue
+                rendered.append({"role": role, "content": text})
+            return rendered, ("\n".join(system) if system else None)
+
+        @staticmethod
+        def _output_text(response: Any) -> str | None:
+            """A ChatResponse's message content, a CompletionResponse's text,
+            or a plain string."""
+            if response is None:
+                return None
+            if isinstance(response, str):
+                return response
+            message = getattr(response, "message", None)
+            if message is not None:
+                content = getattr(message, "content", None)
+                if content is None:
+                    content = getattr(message, "blocks", None)
+                return message_text(content)
+            text = getattr(response, "text", None)
+            return text if isinstance(text, str) else None
 
         @staticmethod
         def _extract_model_name(payload: dict | None) -> str | None:

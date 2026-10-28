@@ -16,6 +16,13 @@ Emits:
     input tokens, output tokens, cached and reasoning tokens where the
     model reports them, `finish_reason` and the number of tool calls
   - `llm_call` with `status: "error"` when a model call raises
+  - on streamed calls (`on_llm_new_token` fired) `stream: true` and
+    `ttft_ms`, the time from the model start to the first token that
+    carried text or a tool-call chunk
+  - with `agentping.init(capture_llm_content=True)`: `input` (the chat
+    messages as `{role, content}`, LangChain types mapped human→user,
+    ai→assistant, tool→tool), `system_instructions` (the system
+    messages) and `output` (the generation's text)
   - `tool_call` when a tool finishes or raises, with its input, output,
     latency and `tool_invocation_id` (the LangChain run id)
   - `error` when a chain raises
@@ -34,9 +41,13 @@ from uuid import UUID
 from .. import _warnings
 from ._shared import (
     DEFAULT_TOOL_PAYLOAD_MAX_CHARS,
+    FirstChunkClock,
     ToolPayloadOptions,
+    content_capture_enabled,
     error_fields,
     latency_ms,
+    message_text,
+    put_content,
     put_if_positive,
     put_if_str,
 )
@@ -67,13 +78,33 @@ def _version_supported(version: str) -> bool:
     return major < 2
 
 
-class _LlmStart:
-    __slots__ = ("start", "model", "provider")
+_ROLE_BY_MESSAGE_TYPE = {
+    "human": "user",
+    "ai": "assistant",
+    "system": "system",
+    "tool": "tool",
+    "function": "tool",
+}
 
-    def __init__(self, model: str | None, provider: str | None) -> None:
+
+class _LlmStart(FirstChunkClock):
+    """What `on_llm_start` / `on_chat_model_start` knew, kept until the end
+    callback: the clock, the model and, when content capture is on, the
+    prompt. `streamed` flips when `on_llm_new_token` fires."""
+
+    def __init__(
+        self,
+        model: str | None,
+        provider: str | None,
+        input_value: Any = None,
+        system: str | None = None,
+    ) -> None:
         self.start = time.monotonic()
         self.model = model
         self.provider = provider
+        self.input = input_value
+        self.system = system
+        self.streamed = False
 
 
 class _ToolStart:
@@ -149,7 +180,10 @@ def _make_handler_class() -> Any:
             run_id: UUID,
             **kwargs: Any,
         ) -> None:
-            self._remember_llm_start(serialized, run_id, kwargs)
+            input_value = None
+            if content_capture_enabled() and prompts:
+                input_value = prompts[0]
+            self._remember_llm_start(serialized, run_id, kwargs, input_value, None)
 
         def on_chat_model_start(
             self,
@@ -159,16 +193,52 @@ def _make_handler_class() -> Any:
             run_id: UUID,
             **kwargs: Any,
         ) -> None:
-            self._remember_llm_start(serialized, run_id, kwargs)
+            input_value, system = None, None
+            if content_capture_enabled() and messages:
+                try:
+                    input_value, system = self._convert_messages(messages[0])
+                except Exception:
+                    input_value, system = None, None
+            self._remember_llm_start(serialized, run_id, kwargs, input_value, system)
 
-        def _remember_llm_start(self, serialized: Any, run_id: UUID, kwargs: dict[str, Any]) -> None:
+        def _remember_llm_start(
+            self,
+            serialized: Any,
+            run_id: UUID,
+            kwargs: dict[str, Any],
+            input_value: Any = None,
+            system: str | None = None,
+        ) -> None:
             metadata = kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else {}
             model = metadata.get("ls_model_name") or self._extract_model_name(serialized, kwargs)
             provider = metadata.get("ls_provider") or self._provider_from_class(serialized)
             self._llm_starts[run_id] = _LlmStart(
                 str(model) if model else None,
                 str(provider).lower() if provider else None,
+                input_value,
+                system,
             )
+
+        def on_llm_new_token(
+            self,
+            token: Any,
+            *,
+            chunk: Any = None,
+            run_id: UUID,
+            **kwargs: Any,
+        ) -> None:
+            # Only streamed calls deliver tokens. The first one that carries
+            # text or a tool-call chunk is the time to first token; empty
+            # housekeeping chunks (Anthropic's message_start) are not.
+            start_info = self._llm_starts.get(run_id)
+            if start_info is None:
+                return
+            try:
+                start_info.streamed = True
+                if token or self._chunk_has_tool_call(chunk):
+                    start_info.mark_content()
+            except Exception:
+                pass
 
         def on_llm_end(
             self,
@@ -231,6 +301,15 @@ def _make_handler_class() -> Any:
                     or response_meta.get("stop_reason"),
                 )
                 put_if_positive(payload, "tool_calls", len(getattr(message, "tool_calls", None) or []))
+                if start_info is not None and start_info.streamed:
+                    payload["stream"] = True
+                    start_info.put_ttft(payload, start_info.start)
+                put_content(
+                    payload,
+                    input=start_info.input if start_info else None,
+                    system=start_info.system if start_info else None,
+                    output=self._output_text(generation, message),
+                )
 
                 emit_llm_call(payload)
             except Exception:
@@ -362,6 +441,47 @@ def _make_handler_class() -> Any:
             if generations and generations[0]:
                 return generations[0][0]
             return None
+
+        @staticmethod
+        def _convert_messages(messages: Any) -> tuple[list[dict[str, str]], str | None]:
+            """LangChain BaseMessages as the wire's [{role, content}], with the
+            system messages split off into `system_instructions`."""
+            rendered: list[dict[str, str]] = []
+            system: list[str] = []
+            for message in messages or []:
+                if isinstance(message, str):
+                    rendered.append({"role": "user", "content": message})
+                    continue
+                kind = _get(message, "type")
+                role = _ROLE_BY_MESSAGE_TYPE.get(kind) if isinstance(kind, str) else None
+                if role is None:
+                    explicit = _get(message, "role")
+                    role = explicit if isinstance(explicit, str) and explicit else (kind if isinstance(kind, str) else "user")
+                content = message_text(_get(message, "content"))
+                if role == "system":
+                    if content:
+                        system.append(content)
+                    continue
+                rendered.append({"role": role, "content": content})
+            return rendered, ("\n".join(system) if system else None)
+
+        @staticmethod
+        def _chunk_has_tool_call(chunk: Any) -> bool:
+            message = getattr(chunk, "message", None)
+            if message is None:
+                return False
+            return bool(getattr(message, "tool_call_chunks", None) or getattr(message, "tool_calls", None))
+
+        @staticmethod
+        def _output_text(generation: Any, message: Any) -> str | None:
+            """The generation's text: the chat message's content when there
+            is one (it may be a list of blocks), else the plain `text`."""
+            if generation is None:
+                return None
+            if message is not None:
+                return message_text(getattr(message, "content", None))
+            text = getattr(generation, "text", None)
+            return text if isinstance(text, str) else None
 
         @staticmethod
         def _first_present(usage: Any, legacy: Any, keys: tuple[str, ...]) -> Any:

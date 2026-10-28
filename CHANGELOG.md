@@ -12,15 +12,30 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   or prompt version that produced it (`AGENTPING_VERSION` also works). The
   dashboard's Spend and Verify charts mark where each new version was first
   seen. `conversation()` takes it too.
-- Streamed Anthropic and OpenAI calls report `ttft_ms`, the time from the
-  request to the first content chunk, charted on Pulse as time to first token.
+- Streamed provider calls (Anthropic, OpenAI, Gemini, Mistral, Cohere and
+  Bedrock ConverseStream) report `ttft_ms`, the time from the request to the
+  first content chunk, charted on Pulse as time to first token. Anthropic
   `messages.stream()` context managers do not, because the SDK iterates the
   stream itself.
 - `init(capture_llm_content=True, llm_content_max_chars=4000)` sends the prompt
-  and completion on auto-instrumented Anthropic and OpenAI `llm_call` events:
-  `input` as a list of `{role, content}` messages, `output` as text, and
-  `system_instructions`. Off by default; each piece is clipped at the cap. The
-  run page renders them as role-labelled messages.
+  and completion on every auto-instrumented provider `llm_call` (Anthropic,
+  OpenAI, Gemini, Mistral, Cohere and Bedrock Converse): `input` as a list of
+  `{role, content}` messages, `output` as text, and `system_instructions`. Off
+  by default; each piece is clipped at the cap. Non-text parts appear as
+  bracketed markers such as `[image]` or `[tool_use lookup]`, Gemini's `model`
+  role is reported as `assistant`, and Bedrock InvokeModel bodies are not
+  captured. The run page renders them as role-labelled messages.
+- The framework integrations honour `capture_llm_content` too. LangChain's
+  `AgentPingCallbackHandler` sends the chat messages (`human`/`ai`/`tool` mapped
+  to `user`/`assistant`/`tool`, system messages as `system_instructions`) and the
+  generation text, and on streamed calls `stream: true` plus `ttft_ms` from the
+  first `on_llm_new_token` that carried text or a tool-call chunk. LlamaIndex
+  sends the chat messages or formatted prompt and the response text; OpenAI
+  Agents sends the input items, the system prompt and the `output_text` parts;
+  Pydantic AI sends the run's message history before the final answer and
+  `result.output`; CrewAI sends the crew's final answer as `output` (no prompt
+  is available at kickoff level). None of these but LangChain has a per-token
+  hook, so they report no `ttft_ms`.
 - Events carry `turn`, and `conversation()` models a chat session as one run
   (from the previous unreleased commits).
 

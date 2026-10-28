@@ -158,13 +158,6 @@ Agents handoffs and agent boundaries arrive as `step` events.
 Per-integration docs:
 [Anthropic](https://agentping.io/docs/providers/anthropic) ·
 [OpenAI](https://agentping.io/docs/providers/openai) ·
-
-Prompt and completion text are off by default. Turn them on with
-`agentping.init(capture_llm_content=True)` and auto-instrumented Anthropic and
-OpenAI calls add `input` (a list of `{role, content}` messages), `output` and
-`system_instructions` to each `llm_call`, each clipped at
-`llm_content_max_chars` (default 4000). The run page shows them as messages.
-Streamed calls also report `ttft_ms`, the time to the first content chunk.
 [Gemini](https://agentping.io/docs/providers/gemini) ·
 [Mistral](https://agentping.io/docs/providers/mistral) ·
 [Cohere](https://agentping.io/docs/providers/cohere) ·
@@ -174,6 +167,24 @@ Streamed calls also report `ttft_ms`, the time to the first content chunk.
 [Pydantic AI](https://agentping.io/docs/frameworks/pydantic-ai) ·
 [CrewAI](https://agentping.io/docs/frameworks/crewai) ·
 [OpenAI Agents](https://agentping.io/docs/frameworks/openai-agents).
+
+Prompt and completion text are off by default. Turn them on with
+`agentping.init(capture_llm_content=True)` and every auto-instrumented
+provider call (Anthropic, OpenAI, Gemini, Mistral, Cohere and Bedrock
+Converse) adds `input` (a list of `{role, content}` messages), `output` and
+`system_instructions` to its `llm_call`, each clipped at
+`llm_content_max_chars` (default 4000). Non-text parts (images, tool calls,
+tool results) appear as bracketed markers, Gemini's `model` role is reported
+as `assistant`, and Bedrock InvokeModel bodies are not captured. The run page
+shows them as messages. The LangChain, LlamaIndex and OpenAI Agents handlers
+send the same fields from their callbacks; Pydantic AI sends the run's message
+history and `result.output`; CrewAI sends the crew's final answer as `output`
+only.
+
+Streamed provider calls also report `ttft_ms`, the time to the first content
+chunk. LangChain measures it from `on_llm_new_token`; the other frameworks
+give no per-token hook. Anthropic `messages.stream()` context managers do not
+report it, because the SDK iterates the stream itself.
 
 ## Contract guarantees
 

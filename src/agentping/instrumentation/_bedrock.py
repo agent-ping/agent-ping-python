@@ -11,6 +11,12 @@ Converse follows Anthropic semantics: `inputTokens` excludes the cached
 prefix, so the cache read and write counts are added back to give ingest
 the gross figure it expects.
 
+ConverseStream reports `ttft_ms` from the first content block event. With
+`init(capture_llm_content=True)` Converse and ConverseStream also carry
+`messages` as `input`, `system` as `system_instructions` and the reply's
+text blocks as `output`. InvokeModel bodies are provider-specific bytes and
+are not captured.
+
 Why this patch point: boto3 clients are created dynamically by service
 class factories, so patching the BedrockRuntime class itself is fragile.
 `_make_api_call` is the single funnel every boto3 operation goes through;
@@ -24,7 +30,16 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._shared import (
+    FirstChunkClock,
+    content_capture_enabled,
+    emit_errored_llm_call,
+    latency_ms,
+    put_content,
+    put_if_positive,
+    put_if_str,
+    stringify_payload,
+)
 from ._streaming import StreamProxy, emit_llm_call
 
 _PATCHED = False
@@ -81,7 +96,64 @@ def _count_tool_uses(response: Any) -> int:
     return sum(1 for block in message.get("content") or [] if isinstance(block, dict) and "toolUse" in block)
 
 
-def _build_converse_payload(model: str, response: Any, latency: int, stream: bool = False) -> dict[str, Any]:
+def _blocks_text(blocks: Any) -> str:
+    """Converse content blocks as text: `text` blocks verbatim, anything else
+    (toolUse, toolResult, image, document) as a bracketed marker."""
+    if isinstance(blocks, str):
+        return blocks
+    pieces: list[str] = []
+    for block in blocks or []:
+        if isinstance(block, str):
+            pieces.append(block)
+        elif isinstance(block, dict):
+            if isinstance(block.get("text"), str):
+                pieces.append(block["text"])
+            elif block:
+                kind = next(iter(block))
+                name = (block.get(kind) or {}).get("name") if isinstance(block.get(kind), dict) else None
+                pieces.append(f"[{kind}{' ' + name if isinstance(name, str) else ''}]")
+        else:
+            pieces.append(stringify_payload(block, 200) or "")
+    return "\n".join(pieces)
+
+
+def _render_messages(messages: Any) -> list[dict[str, str]] | None:
+    if not isinstance(messages, list):
+        return None
+    out: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        out.append({
+            "role": role if isinstance(role, str) and role else "user",
+            "content": _blocks_text(message.get("content")),
+        })
+    return out
+
+
+def _response_text(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    message = (response.get("output") or {}).get("message") or {}
+    return "".join(
+        block["text"] for block in message.get("content") or [] if isinstance(block, dict) and isinstance(block.get("text"), str)
+    )
+
+
+def _put_converse_content(payload: dict[str, Any], params: dict[str, Any] | None, output: str) -> None:
+    params = params if isinstance(params, dict) else {}
+    put_content(
+        payload,
+        input=_render_messages(params.get("messages")),
+        system=_blocks_text(params.get("system")) if params.get("system") else None,
+        output=output,
+    )
+
+
+def _build_converse_payload(
+    model: str, response: Any, latency: int, stream: bool = False, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "bedrock",
         "latency_ms": latency,
@@ -94,6 +166,7 @@ def _build_converse_payload(model: str, response: Any, latency: int, stream: boo
         put_if_positive(payload, "tool_calls", _count_tool_uses(response))
     if stream:
         payload["stream"] = True
+    _put_converse_content(payload, params, _response_text(response))
     return payload
 
 
@@ -127,20 +200,28 @@ def _is_bedrock_runtime(client: Any) -> bool:
         return False
 
 
-class _ConverseStreamAccumulator:
+class _ConverseStreamAccumulator(FirstChunkClock):
     """The terminal `metadata` event carries the final usage block,
-    `messageStop` the stop reason, and each `contentBlockStart` with a
-    `toolUse` is one tool call."""
+    `messageStop` the stop reason, each `contentBlockStart` with a
+    `toolUse` is one tool call, and `contentBlockDelta` carries the text."""
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, params: dict[str, Any] | None = None) -> None:
         self.model = model
         self.usage: Any = None
         self.finish_reason: str | None = None
         self.tool_calls = 0
+        self.params = params
+        self.text: list[str] = []
+        self.capture = content_capture_enabled()
 
     def observe(self, event: Any) -> None:
         if not isinstance(event, dict):
             return
+        if "contentBlockStart" in event or "contentBlockDelta" in event:
+            self.mark_content()
+        delta = (event.get("contentBlockDelta") or {}).get("delta")
+        if self.capture and isinstance(delta, dict) and isinstance(delta.get("text"), str):
+            self.text.append(delta["text"])
         metadata = event.get("metadata")
         if isinstance(metadata, dict) and metadata.get("usage"):
             self.usage = metadata["usage"]
@@ -161,17 +242,19 @@ class _ConverseStreamAccumulator:
         payload.update(_usage_fields(self.usage))
         put_if_str(payload, "finish_reason", self.finish_reason)
         put_if_positive(payload, "tool_calls", self.tool_calls)
+        self.put_ttft(payload, start)
+        _put_converse_content(payload, self.params, "".join(self.text))
         return payload
 
 
-def _wrap_converse_stream(result: Any, model: str, start: float) -> Any:
+def _wrap_converse_stream(result: Any, model: str, start: float, params: dict[str, Any] | None = None) -> Any:
     """Bedrock's ConverseStream returns {"stream": <event iterator>}. Wrap
     the iterator so events pass through unchanged and one llm_call is
     emitted when the stream closes."""
     if not isinstance(result, dict) or "stream" not in result:
         return result
 
-    acc = _ConverseStreamAccumulator(model)
+    acc = _ConverseStreamAccumulator(model, params)
 
     def on_complete() -> None:
         emit_llm_call(acc.payload(start))
@@ -223,11 +306,11 @@ def instrument() -> None:
             raise
 
         if operation_name == "ConverseStream":
-            return _wrap_converse_stream(result, model, start)
+            return _wrap_converse_stream(result, model, start, api_params)
 
         try:
             if operation_name == "Converse":
-                payload = _build_converse_payload(model, result, latency_ms(start))
+                payload = _build_converse_payload(model, result, latency_ms(start), params=api_params)
             else:  # InvokeModel, InvokeModelWithResponseStream
                 payload = _build_invoke_payload(model, result, latency_ms(start))
                 if streaming:

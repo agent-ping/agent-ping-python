@@ -83,6 +83,19 @@ not against one run that passes the check and then loops forever. Drop
 `guard.check(...)` at several points (top of a loop, between phases) to turn it
 into a series of gates. Thresholds are set in USD.
 
+## Run options
+
+```python
+agentping.init(api_key="apk_eu_...", version="2026.10.27")   # default for every run
+run = agentping.run("support-triage", customer_id="cust_123", feature="routing",
+                    goal="Answer the ticket", version="prompt-v7")   # per-run override
+```
+
+`version` is the build or prompt version that produced the run. The Spend and
+Verify charts mark the bucket where each agent's new version was first seen, so
+a cost or score shift reads against the deploy that preceded it.
+`AGENTPING_VERSION` sets the default without code.
+
 ## Auto-instrumentation
 
 One-line patches for each supported provider and framework. Calls made
@@ -154,6 +167,24 @@ Per-integration docs:
 [Pydantic AI](https://agentping.io/docs/frameworks/pydantic-ai) ·
 [CrewAI](https://agentping.io/docs/frameworks/crewai) ·
 [OpenAI Agents](https://agentping.io/docs/frameworks/openai-agents).
+
+Prompt and completion text are off by default. Turn them on with
+`agentping.init(capture_llm_content=True)` and every auto-instrumented
+provider call (Anthropic, OpenAI, Gemini, Mistral, Cohere and Bedrock
+Converse) adds `input` (a list of `{role, content}` messages), `output` and
+`system_instructions` to its `llm_call`, each clipped at
+`llm_content_max_chars` (default 4000). Non-text parts (images, tool calls,
+tool results) appear as bracketed markers, Gemini's `model` role is reported
+as `assistant`, and Bedrock InvokeModel bodies are not captured. The run page
+shows them as messages. The LangChain, LlamaIndex and OpenAI Agents handlers
+send the same fields from their callbacks; Pydantic AI sends the run's message
+history and `result.output`; CrewAI sends the crew's final answer as `output`
+only.
+
+Streamed provider calls also report `ttft_ms`, the time to the first content
+chunk. LangChain measures it from `on_llm_new_token`; the other frameworks
+give no per-token hook. Anthropic `messages.stream()` context managers do not
+report it, because the SDK iterates the stream itself.
 
 ## Contract guarantees
 

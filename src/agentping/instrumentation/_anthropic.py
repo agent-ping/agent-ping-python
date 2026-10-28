@@ -18,7 +18,15 @@ from types import SimpleNamespace
 from typing import Any
 
 from .. import _warnings
-from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._shared import (
+    FirstChunkClock,
+    content_capture_enabled,
+    emit_errored_llm_call,
+    latency_ms,
+    put_content,
+    put_if_positive,
+    put_if_str,
+)
 from ._streaming import AsyncStreamProxy, StreamProxy, emit_llm_call
 
 _PATCHED = False
@@ -66,7 +74,19 @@ def _count_tool_uses(content: Any) -> int:
     return count
 
 
-def _build_payload(response: Any, latency: int, stream: bool = False) -> dict[str, Any]:
+def _text_of(content: Any) -> str:
+    """The text blocks of a response's content, joined."""
+    pieces: list[str] = []
+    for block in content or []:
+        kind = getattr(block, "type", None) if not isinstance(block, dict) else block.get("type")
+        if kind == "text":
+            text = getattr(block, "text", None) if not isinstance(block, dict) else block.get("text")
+            if isinstance(text, str):
+                pieces.append(text)
+    return "".join(pieces)
+
+
+def _build_payload(response: Any, latency: int, stream: bool = False, request: dict[str, Any] | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "anthropic",
         "latency_ms": latency,
@@ -79,10 +99,17 @@ def _build_payload(response: Any, latency: int, stream: bool = False) -> dict[st
     put_if_positive(payload, "tool_calls", _count_tool_uses(getattr(response, "content", None)))
     if stream:
         payload["stream"] = True
+    request = request or {}
+    put_content(
+        payload,
+        input=request.get("messages"),
+        system=request.get("system"),
+        output=_text_of(getattr(response, "content", None)),
+    )
     return payload
 
 
-class _EventAccumulator:
+class _EventAccumulator(FirstChunkClock):
     """Builds the llm_call payload from raw `stream=True` events.
 
     Usage arrives in two places: `message_start` carries the input side and
@@ -90,14 +117,24 @@ class _EventAccumulator:
     wins rather than being summed.
     """
 
-    def __init__(self, model: str | None) -> None:
+    def __init__(self, model: str | None, request: dict[str, Any] | None = None) -> None:
         self.model = model
         self.usage: dict[str, int] = {}
         self.finish_reason: str | None = None
         self.tool_calls = 0
+        self.request = request or {}
+        self.text: list[str] = []
+        self.capture = content_capture_enabled()
 
     def observe(self, event: Any) -> None:
         kind = getattr(event, "type", None)
+        if kind in ("content_block_start", "content_block_delta"):
+            self.mark_content()
+        if kind == "content_block_delta" and self.capture:
+            delta = getattr(event, "delta", None)
+            text = getattr(delta, "text", None)
+            if isinstance(text, str) and getattr(delta, "type", "text_delta") == "text_delta":
+                self.text.append(text)
         if kind == "message_start":
             message = getattr(event, "message", None)
             self.model = getattr(message, "model", None) or self.model
@@ -138,11 +175,13 @@ class _EventAccumulator:
             payload.update(_usage_fields(SimpleNamespace(**self.usage)))
         put_if_str(payload, "finish_reason", self.finish_reason)
         put_if_positive(payload, "tool_calls", self.tool_calls)
+        self.put_ttft(payload, start)
+        put_content(payload, input=self.request.get("messages"), system=self.request.get("system"), output="".join(self.text))
         return payload
 
 
-def _wrap_stream(result: Any, model: str | None, start: float, is_async: bool) -> Any:
-    acc = _EventAccumulator(model)
+def _wrap_stream(result: Any, model: str | None, start: float, is_async: bool, request: dict[str, Any] | None = None) -> Any:
+    acc = _EventAccumulator(model, request)
 
     def on_complete() -> None:
         emit_llm_call(acc.payload(start))
@@ -162,10 +201,11 @@ class _StreamManagerProxy:
     consuming anything the caller did not.
     """
 
-    def __init__(self, inner: Any, model: str | None, start: float) -> None:
+    def __init__(self, inner: Any, model: str | None, start: float, request: dict[str, Any] | None = None) -> None:
         self._inner = inner
         self._model = model
         self._start = start
+        self._request = request or {}
         self._stream: Any = None
 
     def __enter__(self) -> Any:
@@ -192,7 +232,7 @@ class _StreamManagerProxy:
                 return
             if snapshot is None:
                 return
-            payload = _build_payload(snapshot, latency_ms(self._start), stream=True)
+            payload = _build_payload(snapshot, latency_ms(self._start), stream=True, request=self._request)
             if not payload.get("model"):
                 payload["model"] = self._model or "unknown"
             emit_llm_call(payload)
@@ -255,9 +295,9 @@ def instrument() -> None:
             emit_errored_llm_call("anthropic", model, start, exc)
             raise
         if kwargs.get("stream"):
-            return _wrap_stream(result, model, start, is_async=False)
+            return _wrap_stream(result, model, start, is_async=False, request=kwargs)
         try:
-            emit_llm_call(_build_payload(result, latency_ms(start)))
+            emit_llm_call(_build_payload(result, latency_ms(start), request=kwargs))
         except Exception:
             pass
         return result
@@ -276,7 +316,7 @@ def instrument() -> None:
             except BaseException as exc:
                 emit_errored_llm_call("anthropic", model, start, exc, {"stream": True})
                 raise
-            return _StreamManagerProxy(manager, model, start)
+            return _StreamManagerProxy(manager, model, start, kwargs)
 
         Messages.stream = patched_stream
         Messages._agentping_original_stream = original_stream
@@ -295,9 +335,9 @@ def instrument() -> None:
                 emit_errored_llm_call("anthropic", model, start, exc)
                 raise
             if kwargs.get("stream"):
-                return _wrap_stream(result, model, start, is_async=True)
+                return _wrap_stream(result, model, start, is_async=True, request=kwargs)
             try:
-                emit_llm_call(_build_payload(result, latency_ms(start)))
+                emit_llm_call(_build_payload(result, latency_ms(start), request=kwargs))
             except Exception:
                 pass
             return result
@@ -316,7 +356,7 @@ def instrument() -> None:
                 except BaseException as exc:
                     emit_errored_llm_call("anthropic", model, start, exc, {"stream": True})
                     raise
-                return _AsyncStreamManagerProxy(manager, model, start)
+                return _AsyncStreamManagerProxy(manager, model, start, kwargs)
 
             AsyncMessages.stream = patched_async_stream
             AsyncMessages._agentping_original_stream = async_original_stream

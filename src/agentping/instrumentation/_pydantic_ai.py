@@ -8,6 +8,13 @@ model exchange in the loop, including tool retries, and its
 
 A run that raises emits an errored `llm_call` (`status: "error"`, the
 exception class) and re-raises.
+
+With `agentping.init(capture_llm_content=True)` the event carries the
+run's message history: `input` is every ModelRequest / ModelResponse
+before the final answer as `{role, content}` (system-prompt parts split
+off into `system_instructions`, tool returns as `tool`, tool calls as
+`[tool-call name]`), `output` is `result.output`. `run_sync` / `run`
+return only once the loop is done, so there is no `ttft_ms`.
 """
 
 from __future__ import annotations
@@ -16,7 +23,15 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._shared import emit_errored_llm_call, latency_ms, put_if_positive
+from ._shared import (
+    content_capture_enabled,
+    emit_errored_llm_call,
+    latency_ms,
+    message_text,
+    put_content,
+    put_if_positive,
+    stringify_payload,
+)
 from ._streaming import emit_llm_call
 
 _PATCHED = False
@@ -64,6 +79,85 @@ def _usage_of(result: Any) -> Any:
     return usage
 
 
+def _part_text(part: Any) -> str:
+    content = getattr(part, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return message_text(content)
+    return stringify_payload(content) or ""
+
+
+def _render_history(messages: Any) -> tuple[list[dict[str, str]], str | None]:
+    """Pydantic AI's ModelRequest / ModelResponse list as [{role, content}].
+
+    Request parts become one message each (user-prompt → user, tool-return
+    and retry-prompt → tool / user); system-prompt parts are collected into
+    the system text. A response's text and tool-call parts are joined into
+    one assistant message.
+    """
+    rendered: list[dict[str, str]] = []
+    system: list[str] = []
+    for message in messages or []:
+        parts = getattr(message, "parts", None) or []
+        if getattr(message, "kind", None) == "response":
+            text = _response_text(parts)
+            if text:
+                rendered.append({"role": "assistant", "content": text})
+            continue
+        for part in parts:
+            kind = getattr(part, "part_kind", None)
+            if kind == "system-prompt":
+                text = _part_text(part)
+                if text:
+                    system.append(text)
+            elif kind == "tool-return":
+                rendered.append({"role": "tool", "content": _part_text(part)})
+            elif kind in ("user-prompt", "retry-prompt"):
+                rendered.append({"role": "user", "content": _part_text(part)})
+            elif isinstance(kind, str):
+                rendered.append({"role": "user", "content": f"[{kind}]"})
+    return rendered, ("\n".join(system) if system else None)
+
+
+def _response_text(parts: Any) -> str:
+    pieces: list[str] = []
+    for part in parts or []:
+        kind = getattr(part, "part_kind", None)
+        if kind == "text":
+            pieces.append(_part_text(part))
+        elif kind == "tool-call":
+            name = getattr(part, "tool_name", None)
+            pieces.append(f"[tool-call{' ' + name if isinstance(name, str) else ''}]")
+        elif kind == "thinking":
+            continue
+        elif isinstance(kind, str):
+            pieces.append(f"[{kind}]")
+    return "\n".join(piece for piece in pieces if piece)
+
+
+def _put_run_content(payload: dict[str, Any], result: Any) -> None:
+    if not content_capture_enabled():
+        return
+    messages: Any = None
+    all_messages = getattr(result, "all_messages", None)
+    if callable(all_messages):
+        try:
+            messages = list(all_messages())
+        except Exception:
+            messages = None
+    # The last response is the answer; everything before it is the prompt.
+    if messages and getattr(messages[-1], "kind", None) == "response":
+        messages = messages[:-1]
+    rendered, system = _render_history(messages)
+    output = getattr(result, "output", None)
+    if output is None:
+        output = getattr(result, "data", None)
+    if output is not None and not isinstance(output, str):
+        output = stringify_payload(output)
+    put_content(payload, input=rendered or None, system=system, output=output)
+
+
 def _build_payload(result: Any, agent: Any, latency: int) -> dict[str, Any]:
     provider, model_name = _resolve_provider_and_model(agent)
     payload: dict[str, Any] = {
@@ -72,6 +166,7 @@ def _build_payload(result: Any, agent: Any, latency: int) -> dict[str, Any]:
     }
     if model_name:
         payload["model"] = model_name
+    _put_run_content(payload, result)
 
     usage = _usage_of(result)
     if usage is None:

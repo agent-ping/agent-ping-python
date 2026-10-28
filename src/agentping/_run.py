@@ -26,18 +26,24 @@ class Run:
         metadata: dict[str, Any] | None = None,
         parent_run_id: str | None = None,
         goal: str | None = None,
+        idle_timeout_seconds: int | None = None,
+        idle_timeout_status: str | None = None,
+        resume: tuple[str, str] | None = None,
+        version: str | None = None,
     ) -> None:
         s = _state.state()
         region = s.region or "eu"
         self._region = region
-        self.id: str = _ids.new_id("run", region)
+        self.id: str = resume[0] if resume else _ids.new_id("run", region)
         self.agent: str = agent
         self.customer_id = customer_id
         self.feature = feature
         self.goal = goal
+        # A run's own version beats the init()-level default.
+        self.version: str | None = (version if version is not None else s.version).strip() or None
         self.metadata = metadata or {}
         self.parent_run_id = parent_run_id or os.environ.get("AGENTPING_PARENT_RUN")
-        self.started_at = _iso()
+        self.started_at = resume[1] if resume else _iso()
         self._finished = False
 
         body: dict[str, Any] = {
@@ -51,25 +57,38 @@ class Run:
             body["feature"] = feature
         if goal is not None:
             body["goal"] = goal
+        if self.version is not None:
+            body["version"] = self.version
         if metadata:
             body["metadata"] = metadata
         if self.parent_run_id:
             body["parent_run_id"] = self.parent_run_id
+        if idle_timeout_seconds is not None:
+            body["idle_timeout_seconds"] = idle_timeout_seconds
+            if idle_timeout_status is not None:
+                body["idle_timeout_status"] = idle_timeout_status
 
         _state.enqueue("/v1/runs", body)
 
-    def event(self, type: str, data: dict[str, Any] | None = None) -> str:
+    def event(self, type: str, data: dict[str, Any] | None = None, turn: int | None = None) -> str:
+        """Append an event to the run.
+
+        Args:
+            turn: Which exchange of a conversation this belongs to, counting from
+                1. One turn is often several events -- call the model, run a tool,
+                call it again -- and this is what groups them. Omit for work that
+                is not a conversation.
+        """
         evt_id = _ids.new_id("evt", self._region)
-        body = {
-            "events": [
-                {
-                    "external_id": evt_id,
-                    "type": type,
-                    "ts": _iso(),
-                    "data": data or {},
-                }
-            ]
+        entry: dict[str, Any] = {
+            "external_id": evt_id,
+            "type": type,
+            "ts": _iso(),
+            "data": data or {},
         }
+        if turn is not None:
+            entry["turn"] = turn
+        body = {"events": [entry]}
         _state.enqueue(f"/v1/runs/{self.id}/events", body)
         return evt_id
 

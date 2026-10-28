@@ -18,7 +18,15 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._shared import emit_errored_llm_call, latency_ms, put_if_positive, put_if_str
+from ._shared import (
+    FirstChunkClock,
+    content_capture_enabled,
+    emit_errored_llm_call,
+    latency_ms,
+    put_content,
+    put_if_positive,
+    put_if_str,
+)
 from ._streaming import AsyncStreamProxy, StreamProxy, emit_llm_call
 
 _PATCHED = False
@@ -75,7 +83,7 @@ def _responses_usage_fields(usage: Any) -> dict[str, Any]:
     return fields
 
 
-def _build_payload(response: Any, latency: int, stream: bool = False) -> dict[str, Any]:
+def _build_payload(response: Any, latency: int, stream: bool = False, request: dict[str, Any] | None = None) -> dict[str, Any]:
     """Payload for a Chat Completions response."""
     payload: dict[str, Any] = {"provider": "openai", "latency_ms": latency}
     model = getattr(response, "model", None)
@@ -90,10 +98,13 @@ def _build_payload(response: Any, latency: int, stream: bool = False) -> dict[st
         put_if_positive(payload, "tool_calls", len(getattr(message, "tool_calls", None) or []))
     if stream:
         payload["stream"] = True
+    request = request or {}
+    output = getattr(getattr(choices[0], "message", None), "content", None) if choices else None
+    put_content(payload, input=request.get("messages"), output=output if isinstance(output, str) else None)
     return payload
 
 
-def _build_responses_payload(response: Any, latency: int, stream: bool = False) -> dict[str, Any]:
+def _build_responses_payload(response: Any, latency: int, stream: bool = False, request: dict[str, Any] | None = None) -> dict[str, Any]:
     """Payload for a Responses API response."""
     payload: dict[str, Any] = {"provider": "openai", "latency_ms": latency}
     model = getattr(response, "model", None)
@@ -114,17 +125,28 @@ def _build_responses_payload(response: Any, latency: int, stream: bool = False) 
     put_if_positive(payload, "tool_calls", tool_calls)
     if stream:
         payload["stream"] = True
+    request = request or {}
+    output = getattr(response, "output_text", None)
+    put_content(
+        payload,
+        input=request.get("input"),
+        system=request.get("instructions"),
+        output=output if isinstance(output, str) else None,
+    )
     return payload
 
 
-class _ChatChunkAccumulator:
+class _ChatChunkAccumulator(FirstChunkClock):
     """Folds streamed Chat Completions chunks into one payload."""
 
-    def __init__(self, model: str | None) -> None:
+    def __init__(self, model: str | None, request: dict[str, Any] | None = None) -> None:
         self.model = model
         self.usage: Any = None
         self.finish_reason: str | None = None
         self.tool_call_indexes: set[Any] = set()
+        self.request = request or {}
+        self.text: list[str] = []
+        self.capture = content_capture_enabled()
 
     def observe(self, chunk: Any) -> None:
         self.model = getattr(chunk, "model", None) or self.model
@@ -136,6 +158,13 @@ class _ChatChunkAccumulator:
             if finish:
                 self.finish_reason = finish
             delta = getattr(choice, "delta", None)
+            content = getattr(delta, "content", None)
+            if isinstance(content, str) and content != "":
+                self.mark_content()
+                if self.capture:
+                    self.text.append(content)
+            if getattr(delta, "tool_calls", None):
+                self.mark_content()
             for call in getattr(delta, "tool_calls", None) or []:
                 index = getattr(call, "index", None)
                 self.tool_call_indexes.add(index if index is not None else getattr(call, "id", len(self.tool_call_indexes)))
@@ -150,22 +179,27 @@ class _ChatChunkAccumulator:
         payload.update(_chat_usage_fields(self.usage))
         put_if_str(payload, "finish_reason", self.finish_reason)
         put_if_positive(payload, "tool_calls", len(self.tool_call_indexes))
+        self.put_ttft(payload, start)
+        put_content(payload, input=self.request.get("messages"), output="".join(self.text))
         return payload
 
 
-class _ResponsesEventAccumulator:
+class _ResponsesEventAccumulator(FirstChunkClock):
     """Folds streamed Responses events into one payload.
 
     The terminal `response.completed`, `response.incomplete` and
     `response.failed` events carry the full response, which is all we need.
     """
 
-    def __init__(self, model: str | None) -> None:
+    def __init__(self, model: str | None, request: dict[str, Any] | None = None) -> None:
         self.model = model
         self.final: Any = None
+        self.request = request or {}
 
     def observe(self, event: Any) -> None:
         kind = getattr(event, "type", None)
+        if isinstance(kind, str) and (kind.endswith(".delta") or kind == "response.output_item.added"):
+            self.mark_content()
         if kind in ("response.completed", "response.incomplete", "response.failed"):
             self.final = getattr(event, "response", None)
         elif kind == "response.created" and self.model is None:
@@ -173,15 +207,17 @@ class _ResponsesEventAccumulator:
 
     def payload(self, start: float) -> dict[str, Any]:
         if self.final is not None:
-            payload = _build_responses_payload(self.final, latency_ms(start), stream=True)
+            payload = _build_responses_payload(self.final, latency_ms(start), stream=True, request=self.request)
             payload.setdefault("model", self.model or "unknown")
-            return payload
-        return {
-            "provider": "openai",
-            "model": self.model or "unknown",
-            "latency_ms": latency_ms(start),
-            "stream": True,
-        }
+        else:
+            payload = {
+                "provider": "openai",
+                "model": self.model or "unknown",
+                "latency_ms": latency_ms(start),
+                "stream": True,
+            }
+        self.put_ttft(payload, start)
+        return payload
 
 
 def _wrap_stream(result: Any, acc: Any, start: float, is_async: bool) -> Any:
@@ -205,9 +241,9 @@ def _make_sync(original: Any, build: Any, accumulator: Any) -> Any:
             emit_errored_llm_call("openai", model, start, exc)
             raise
         if kwargs.get("stream"):
-            return _wrap_stream(result, accumulator(model), start, is_async=False)
+            return _wrap_stream(result, accumulator(model, kwargs), start, is_async=False)
         try:
-            emit_llm_call(build(result, latency_ms(start)))
+            emit_llm_call(build(result, latency_ms(start), request=kwargs))
         except Exception:
             pass
         return result
@@ -225,9 +261,9 @@ def _make_async(original: Any, build: Any, accumulator: Any) -> Any:
             emit_errored_llm_call("openai", model, start, exc)
             raise
         if kwargs.get("stream"):
-            return _wrap_stream(result, accumulator(model), start, is_async=True)
+            return _wrap_stream(result, accumulator(model, kwargs), start, is_async=True)
         try:
-            emit_llm_call(build(result, latency_ms(start)))
+            emit_llm_call(build(result, latency_ms(start), request=kwargs))
         except Exception:
             pass
         return result

@@ -19,6 +19,7 @@ from ._worker import Worker
 KNOWN_REGIONS = ("eu", "us")
 DEFAULT_REGION = "eu"
 DEFAULT_QUEUE_SIZE = 1000
+DEFAULT_LLM_CONTENT_MAX_CHARS = 4000
 
 
 def default_base_url_for(region: str) -> str:
@@ -55,6 +56,12 @@ class State:
     control_client: Client | None = None
     initialized: bool = False
     transport: httpx.BaseTransport | None = None
+    # Run-level default: the build or prompt version every run starts with.
+    version: str = ""
+    # Whether auto-instrumentation sends prompt and completion text on
+    # llm_call events, and how long each piece may be.
+    capture_llm_content: bool = False
+    llm_content_max_chars: int = DEFAULT_LLM_CONTENT_MAX_CHARS
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -72,6 +79,9 @@ def init(
     queue_size: int = DEFAULT_QUEUE_SIZE,
     transport: httpx.BaseTransport | None = None,
     control_url: str | None = None,
+    version: str | None = None,
+    capture_llm_content: bool = False,
+    llm_content_max_chars: int = DEFAULT_LLM_CONTENT_MAX_CHARS,
 ) -> None:
     global _atexit_registered
 
@@ -104,6 +114,9 @@ def init(
         _state.region = region
         _state.queue = BoundedQueue(maxsize=queue_size)
         _state.transport = transport
+        _state.version = (version or os.environ.get("AGENTPING_VERSION", "")).strip()
+        _state.capture_llm_content = bool(capture_llm_content)
+        _state.llm_content_max_chars = max(0, int(llm_content_max_chars))
         _state.client = Client(api_key=key, base_url=url, transport=transport)
         _state.control_client = Client(api_key=key, base_url=control, transport=transport)
         _state.worker = Worker(queue=_state.queue, client=_state.client)

@@ -20,9 +20,15 @@ Emits:
     `tool_payload_max_chars`)
   - `step` with `kind: "handoff"` on every agent-to-agent handoff
   - `step` with `kind: "agent"` when an agent finishes its turn
+  - with `agentping.init(capture_llm_content=True)`: `input` (the input
+    items `on_llm_start` saw, as `{role, content}`, function calls and
+    their outputs as `assistant` / `tool`), `system_instructions` (the
+    agent's resolved system prompt) and `output` (the response's
+    `output_text` parts)
 
 The Agents SDK does not surface a failed model call or a tool exception
-through hooks; those land on the run when it fails.
+through hooks; those land on the run when it fails. RunHooks has no
+per-token hook either, so there is no `ttft_ms`.
 """
 
 from __future__ import annotations
@@ -34,9 +40,13 @@ from .. import _warnings
 from ._shared import (
     DEFAULT_TOOL_PAYLOAD_MAX_CHARS,
     ToolPayloadOptions,
+    content_capture_enabled,
     latency_ms,
+    message_text,
+    put_content,
     put_if_positive,
     put_if_str,
+    stringify_payload,
 )
 from ._streaming import _active_run, emit_event, emit_llm_call
 
@@ -82,7 +92,60 @@ def _provider_for(model: str) -> str:
     return "openai"
 
 
-def _build_payload(agent: Any, response: Any) -> dict[str, Any]:
+def _get(obj: Any, key: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _render_input_items(items: Any) -> list[dict[str, str]]:
+    """Responses API input items as [{role, content}]: role-bearing messages
+    as they are, function calls as an assistant marker, their outputs as
+    `tool`. Other item kinds (reasoning, references) are skipped."""
+    rendered: list[dict[str, str]] = []
+    if isinstance(items, str):
+        return [{"role": "user", "content": items}]
+    for item in items or []:
+        if isinstance(item, str):
+            rendered.append({"role": "user", "content": item})
+            continue
+        role = _get(item, "role")
+        kind = _get(item, "type")
+        if isinstance(role, str) and role:
+            rendered.append({"role": role, "content": message_text(_get(item, "content"))})
+        elif kind == "function_call":
+            name = _get(item, "name")
+            rendered.append({"role": "assistant", "content": f"[function_call{' ' + name if isinstance(name, str) else ''}]"})
+        elif kind == "function_call_output":
+            output = _get(item, "output")
+            text = output if isinstance(output, str) else (stringify_payload(output) or "")
+            rendered.append({"role": "tool", "content": text})
+    return rendered
+
+
+def _output_text(response: Any) -> str:
+    """The `output_text` parts of the response's message items, joined."""
+    pieces: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        if _get(item, "type") != "message":
+            continue
+        for part in _get(item, "content") or []:
+            text = _get(part, "text")
+            if _get(part, "type") == "output_text" and isinstance(text, str):
+                pieces.append(text)
+    return "".join(pieces)
+
+
+class _LlmStart:
+    """The clock from `on_llm_start`, plus the prompt when capture is on."""
+
+    def __init__(self, system_prompt: Any = None, input_items: Any = None) -> None:
+        self.start = time.monotonic()
+        self.system_prompt = system_prompt
+        self.input_items = input_items
+
+
+def _build_payload(agent: Any, response: Any, start_info: _LlmStart | None = None) -> dict[str, Any]:
     model = _model_name(agent)
     payload: dict[str, Any] = {
         "provider": _provider_for(model),
@@ -108,6 +171,16 @@ def _build_payload(agent: Any, response: Any) -> dict[str, Any]:
         if getattr(item, "type", None) == "function_call":
             tool_calls += 1
     put_if_positive(payload, "tool_calls", tool_calls)
+
+    if content_capture_enabled():
+        rendered = _render_input_items(start_info.input_items) if start_info is not None else []
+        system = start_info.system_prompt if start_info is not None else None
+        put_content(
+            payload,
+            input=rendered or None,
+            system=system if isinstance(system, str) else None,
+            output=_output_text(response),
+        )
 
     return payload
 
@@ -137,7 +210,7 @@ def _make_hooks_class() -> Any:
         ) -> None:
             self._explicit_run = run
             self._options = ToolPayloadOptions(capture_tool_payloads, tool_payload_max_chars)
-            self._llm_starts: dict[int, float] = {}
+            self._llm_starts: dict[int, _LlmStart] = {}
             self._tool_starts: dict[Any, float] = {}
             self._agent_starts: dict[tuple[int, str], float] = {}
 
@@ -162,7 +235,10 @@ def _make_hooks_class() -> Any:
             system_prompt: Any = None,
             input_items: Any = None,
         ) -> None:
-            self._llm_starts[id(context)] = time.monotonic()
+            if content_capture_enabled():
+                self._llm_starts[id(context)] = _LlmStart(system_prompt, input_items)
+            else:
+                self._llm_starts[id(context)] = _LlmStart()
 
         async def on_llm_end(
             self,
@@ -170,10 +246,10 @@ def _make_hooks_class() -> Any:
             agent: Any,
             response: Any,
         ) -> None:
-            start = self._llm_starts.pop(id(context), None)
+            start_info = self._llm_starts.pop(id(context), None)
             try:
-                payload = _build_payload(agent, response)
-                payload["latency_ms"] = latency_ms(start) if start else 0
+                payload = _build_payload(agent, response, start_info)
+                payload["latency_ms"] = latency_ms(start_info.start) if start_info else 0
                 self._emit("llm_call", payload)
             except Exception:
                 pass

@@ -10,6 +10,11 @@ per-task callback pattern.
 it), so it is reported as-is with `cached_prompt_tokens` alongside.
 A kickoff that raises emits an errored `llm_call` (`status: "error"`,
 the exception class) and re-raises.
+
+With `agentping.init(capture_llm_content=True)` the event carries the
+crew's final answer (`CrewOutput.raw`) as `output`. CrewAI exposes no
+per-call prompt or stream hook here, so there is no `input` and no
+`ttft_ms`.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ import time
 from typing import Any
 
 from .. import _warnings
-from ._shared import emit_errored_llm_call, latency_ms, put_if_positive
+from ._shared import emit_errored_llm_call, latency_ms, put_content, put_if_positive
 from ._streaming import emit_llm_call
 
 _PATCHED = False
@@ -41,11 +46,20 @@ def _version_supported(version: str) -> bool:
     return major == 1
 
 
-def _build_payload(metrics: Any, latency: int) -> dict[str, Any]:
+def _output_text(result: Any) -> str | None:
+    """The crew's final answer: `CrewOutput.raw`, or the string kickoff returned."""
+    if isinstance(result, str):
+        return result
+    raw = getattr(result, "raw", None)
+    return raw if isinstance(raw, str) else None
+
+
+def _build_payload(metrics: Any, latency: int, result: Any = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": "crewai",
         "latency_ms": latency,
     }
+    put_content(payload, output=_output_text(result))
     if metrics is None:
         return payload
 
@@ -94,7 +108,7 @@ def instrument() -> None:
             emit_errored_llm_call("crewai", None, start, exc)
             raise
         try:
-            emit_llm_call(_build_payload(getattr(self, "usage_metrics", None), latency_ms(start)))
+            emit_llm_call(_build_payload(getattr(self, "usage_metrics", None), latency_ms(start), result))
         except Exception:
             pass
         return result
@@ -113,7 +127,7 @@ def instrument() -> None:
                 emit_errored_llm_call("crewai", None, start, exc)
                 raise
             try:
-                emit_llm_call(_build_payload(getattr(self, "usage_metrics", None), latency_ms(start)))
+                emit_llm_call(_build_payload(getattr(self, "usage_metrics", None), latency_ms(start), result))
             except Exception:
                 pass
             return result
